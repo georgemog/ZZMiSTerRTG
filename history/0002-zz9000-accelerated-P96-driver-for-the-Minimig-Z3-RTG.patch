@@ -1,0 +1,3419 @@
+From 3ef0bbd0c2ef5fc4e272a12d61b9633f66ac2483 Mon Sep 17 00:00:00 2001
+From: Nigel Shearman <georgemog@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 09:02:37 +0100
+Subject: [PATCH 2/3] zz9000: accelerated P96 driver for the Minimig Z3 RTG
+ board
+
+Port of the official ZZ9000 RTG stack to the MiSTer Minimig core, with
+no FPGA changes: the ZZ9000OS blitter runs on the HPS inside the MiSTer
+binary and draws into the existing Z3 RTG framebuffer (DDR3 0x27000000).
+
+Amiga side, MiSTerZZ.card (amiga/rtg/mntgfx-gcc.c):
+- finds the $139C/$30 RTG board; P96 gets the bottom $7C0000, the top
+  256KB holds mailbox, GFXData, staging and the mouse save buffer
+- accelerated hooks are the upstream Z3 paths; the blitter_dma_op
+  doorbell becomes a synchronous mailbox kick, with CacheClearU() around
+  the wait because cpu_cache_new caches the RTG window
+- display hooks program rtg.v as MiSTer.card does; ZZ9000-only features
+  (sprite, capture, split, DPMS, offscreen, PIP) are not offered
+- falls back to P96 software routines when no ARM blitter answers
+- MiSTerZZInfo: read-only bring-up/status tool
+
+MiSTer side (mister/, installed into Main_MiSTer by install.py):
+- upstream gfx.c unmodified, built via a wrapper that avoids unaligned,
+  NEON and libc string accesses on the Strongly-ordered /dev/mem mapping
+- dma_rtg.c adapted: private GFXData snapshot, range checks on every
+  Amiga-supplied offset, display/sprite/overlay ops dropped
+- service thread with spin-then-sleep polling and session handshake
+
+Shared protocol in common/mister_zz9000.h. Host test (tests/host) runs
+the exact ARM code against independent reference renderers: 241 checks
+pass under ASan/UBSan. Card, info tool and a full MiSTer binary build on
+the build server. Not yet run on hardware.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ zz9000/README.md                     | 182 ++++++
+ zz9000/UPSTREAM.md                   |  26 +
+ zz9000/amiga/.gitignore              |   2 +
+ zz9000/amiga/Makefile                |  35 ++
+ zz9000/amiga/rtg/mntgfx-gcc.c        | 839 +++++++++++----------------
+ zz9000/amiga/tools/MiSTerZZInfo.c    |  89 +++
+ zz9000/common/mister_zz9000.h        |  98 ++++
+ zz9000/mister/install.py             |  78 +++
+ zz9000/mister/minimig_zz9000.cpp     | 134 +++++
+ zz9000/mister/minimig_zz9000.h       |  18 +
+ zz9000/mister/zz9000_blit.c          |  43 ++
+ zz9000/mister/zz9000_fbmem.c         | 149 +++++
+ zz9000/mister/zz9000_fbmem.h         |  32 +
+ zz9000/mister/zz9000_service.c       | 114 ++++
+ zz9000/mister/zz9000_service.h       |  54 ++
+ zz9000/mister/zz9000os/dma_rtg.c     | 246 +++-----
+ zz9000/mister/zz9000os/video.h       |  25 +
+ zz9000/tests/host/.gitignore         |   2 +
+ zz9000/tests/host/Makefile           |  21 +
+ zz9000/tests/host/zz9000_host_test.c | 568 ++++++++++++++++++
+ 20 files changed, 2101 insertions(+), 654 deletions(-)
+ create mode 100644 zz9000/README.md
+ create mode 100644 zz9000/amiga/.gitignore
+ create mode 100644 zz9000/amiga/Makefile
+ create mode 100644 zz9000/amiga/tools/MiSTerZZInfo.c
+ create mode 100644 zz9000/common/mister_zz9000.h
+ create mode 100755 zz9000/mister/install.py
+ create mode 100644 zz9000/mister/minimig_zz9000.cpp
+ create mode 100644 zz9000/mister/minimig_zz9000.h
+ create mode 100644 zz9000/mister/zz9000_blit.c
+ create mode 100644 zz9000/mister/zz9000_fbmem.c
+ create mode 100644 zz9000/mister/zz9000_fbmem.h
+ create mode 100644 zz9000/mister/zz9000_service.c
+ create mode 100644 zz9000/mister/zz9000_service.h
+ create mode 100644 zz9000/mister/zz9000os/video.h
+ create mode 100644 zz9000/tests/host/.gitignore
+ create mode 100644 zz9000/tests/host/Makefile
+ create mode 100644 zz9000/tests/host/zz9000_host_test.c
+
+diff --git a/zz9000/README.md b/zz9000/README.md
+new file mode 100644
+index 00000000..e7d3665e
+--- /dev/null
++++ b/zz9000/README.md
+@@ -0,0 +1,182 @@
++# ZZ9000 accelerated RTG for the MiSTer Minimig core
++
++The official ZZ9000 Picasso96 driver and the official ZZ9000OS blitter, ported
++to the Minimig core's existing Zorro III RTG board. You get a hardware
++accelerated P96 driver with no FPGA changes: the blitter runs on the MiSTer's
++ARM, inside the Minimig part of the `MiSTer` binary, and draws straight into
++the RTG framebuffer in DDR3.
++
++```
++ Amiga (TG68 020/030)                         MiSTer HPS (ARM, MiSTer binary)
++ ─────────────────────                        ───────────────────────────────
++ Picasso96
++   └─ MiSTerZZ.card  (official ZZ9000.card)    minimig_zz9000.cpp  (thread)
++        FillRect, BlitRect, BlitTemplate…        └─ zz9000_service.c (mailbox)
++        fill GFXData + staging ─┐                    └─ dma_rtg.c  (official dispatcher)
++        mailbox KICK ──────────┐│                        └─ gfx.c  (official ZZ9000OS blitter)
++        wait DONE  ◄─────────┐ ││                                   │
++                             │ ▼▼                                   ▼
++            ┌──────────── Z3 RTG board, 8MB framebuffer = DDR3 @ 0x27000000 ──────────┐
++            │ 0x000000 P96 video memory        │ 0x7C0000 mailbox   0x7C1000 GFXData │
++            │          (scanout via rtg.v)     │ 0x7C2000 staging   0x7FC000 mouse   │
++            └──────────────────────────────────┴─────────────────────────────────────┘
++ Display control (mode size, panning, CLUT, pixel format, on/off) goes from
++ the driver straight to the core's rtg.v registers at board + $800100.
++```
++
++## Layout
++
++| Path | What |
++|------|------|
++| `amiga/rtg/` | Official ZZ9000 driver (`mntgfx-gcc.c` …), adapted → `MiSTerZZ.card` |
++| `amiga/include/` | Official ZZ9000 driver headers, unchanged |
++| `amiga/tools/MiSTerZZInfo.c` | Read-only status tool for bring-up |
++| `mister/zz9000os/` | Official ZZ9000OS `gfx.c`/`gfx.h`/`zz_video_modes.h` (unchanged), `dma_rtg.c` (adapted), `video.h` (shim) |
++| `mister/zz9000_*.c` | MiSTer service: mailbox, build wrapper, framebuffer-safe memcpy |
++| `mister/minimig_zz9000.cpp` | Thread + `/dev/mem` mapping, for `Main_MiSTer/support/minimig/` |
++| `mister/install.py` | Copies the MiSTer side into a Main_MiSTer tree and hooks it up |
++| `common/mister_zz9000.h` | The driver⇄ARM protocol, shared by both sides |
++| `tests/host/` | Host test: drives the exact ARM code the way the 68k does |
++
++`UPSTREAM.md` lists the upstream commits; the first `zz9000:` commit is the
++verbatim import, so `git log -p -- zz9000/` shows every local change.
++
++## Requirements
++
++- A Minimig core with the **Zorro III RTG board** (mfr `$139C`, product `$30`,
++  "Rok Krajnc Minimig Z3 GraphicsCard"): branch `rtg-z3-graphics-card` of
++  `Minimig-AGA_MiSTer`, or the combined A4091+RTG+A2065 core.
++- 68020 or 68030 CPU in the core (Zorro III).
++- Picasso96 (3.x tested by upstream on ZZ9000).
++- A `MiSTer` binary built with this module.
++
++## Build
++
++Amiga side (build server, bebbo GCC 6.5):
++```bash
++cd zz9000/amiga
++export PATH=/opt/amiga/bin:$PATH
++make p96-sdk        # once: Picasso96 developer headers into sdk/
++make                # build/MiSTerZZ.card, build/MiSTerZZInfo
++```
++
++MiSTer side:
++```bash
++zz9000/mister/install.py /path/to/Main_MiSTer
++cd /path/to/Main_MiSTer
++export PATH=/opt/armV7-linux-gcc/bin:$PATH
++make                # bin/MiSTer
++```
++`install.py` is idempotent. It adds `support/minimig/zz9000/*.c` to `C_SRC`
++(upstream `gfx.c` is C and will not build as C++), and calls `zz9000_start()` /
++`zz9000_stop()` next to `a2065_start()` / `a2065_stop()` in `user_io.cpp`.
++
++Host tests (macOS/Linux, ASan + UBSan):
++```bash
++make -C zz9000/tests/host
++```
++
++## Install
++
++1. MiSTer: `killall MiSTer`, copy the new binary to `/media/fat/MiSTer`, then
++   `reboot` (inittab starts MiSTer via sysinit, not respawn; a running binary
++   cannot be overwritten). The log shows `ZZ9000: RTG blitter service started`
++   when the Minimig core loads and `ZZ9000: driver attached` once the Amiga
++   driver has initialised.
++2. Amiga: copy `MiSTerZZ.card` to `LIBS:Picasso96/`. Duplicate the existing
++   MiSTer monitor icon in `DEVS:Monitors`, set its tooltype
++   `BOARDTYPE=MiSTerZZ`, and move the old `MiSTer` monitor out of
++   `DEVS:Monitors` (both drivers claim the same board; whichever runs first
++   wins).
++3. Reboot the Amiga, then run `MiSTerZZInfo`. Expect
++   `=> ARM blitter attached and running`.
++
++If the MiSTer binary has no ZZ9000 support, the driver waits about a second at
++boot, prints nothing on screen, and runs as a plain unaccelerated framebuffer
++(like `MiSTer.card`). If the ARM side disappears later, the driver notices on
++the next blit and drops to Picasso96's software routines.
++
++## What is accelerated
++
++The official ZZ9000 Zorro III code paths, run by the official ZZ9000OS
++blitter: `FillRect`, `InvertRect`, `BlitRect`, `BlitRectNoMaskComplete`
++(all minterms), `BlitTemplate` (text; JAM1/JAM2/COMPLEMENT/INVERSVID),
++`BlitPattern`, `DrawLine` (patterned and solid), `BlitPlanar2Chunky`,
++`BlitPlanar2Direct`.
++
++Pixel formats: the ones `MiSTer.card` has proven on this scanout. CLUT (8-bit),
++R5G6B5PC (16-bit) and R8G8B8A8 (32-bit) are accelerated. B8G8R8 (24-bit) is
++offered too, but drawn in software (the ZZ9000 blitter has no 24-bit mode).
++The ZZ9000 blitter does not care about byte order inside a pixel, only about
++pixel size, so R5G6B5PC and RGBA use its 16-bit and 32-bit paths unchanged.
++
++Not offered, because there is no ZZ9000 video formatter or ARM SDK behind
++the Minimig board: hardware sprite (P96 uses its software sprite),
++video-capture switch, screen split, secondary palette, DPMS, the firmware
++off-screen bitmap allocator, YUV/PIP overlay. The driver reports firmware 2.0
++so that the upstream feature gates switch these off by themselves.
++
++## Design notes
++
++**Synchronous ops, same as the ZZ9000.** On real hardware the op register write
++does not complete until the firmware has run the op. Here `mister_kick()`
++writes `OP`, increments `KICK`, and spins until the ARM writes `DONE`. One
++`GFXData`, no queue: the upstream driver's byte caches and register
++assumptions stay valid, and `WaitBlitter()` has nothing to do.
++
++**FPGA cache coherency.** `cpu_cache_new` in `ddram_ctrl` caches CPU reads of
++the RTG window. The ARM writes behind its back, so the driver calls
++`CacheClearU()` before every mailbox read and once more after `DONE`. On the
++TG68 this pulses CACR bit 3, which clears the whole FPGA cache (instruction and
++data). This is the main cost of an op. If you inhibit caching for `sel_rtg` in
++`cpu_wrapper.v`, you can drop it (see below).
++
++**Strongly-ordered memory.** The framebuffer lies outside Linux RAM, so
++`/dev/mem` maps it uncached and Strongly-ordered. ARMv7 faults every unaligned
++access to such memory. The kernel can emulate scalar accesses slowly, but it
++cannot emulate NEON. So `zz9000_blit.c` compiles the upstream `gfx.c` with
++NEON off, auto-vectorisation off, store merging off and loop-to-libc
++conversion off. It also routes `memcpy`/`memmove`/`memset` to `zz9000_fbmem.c`,
++which uses aligned 32-bit accesses for the bulk of every copy, with
++shift-merge when source and destination are misaligned. The build checks
++this: `objdump -d` of `zz9000_blit.c.o` has 0 NEON loads/stores and no libc
++string calls.
++
++**Byte order.** The core byte-swaps every RTG CPU access, so DDR3 holds the
++framebuffer in Amiga byte order, which is what the ZZ9000's ARM sees too. The
++blitter therefore runs unmodified. Pens are read raw, as upstream does. The
++ARM refuses to attach if the request magic arrives byte-swapped, and logs it.
++
++**Safety.** Every offset that comes from the Amiga is range-checked against the
++8MB window before a pointer is formed (`dma_rtg.c`). Destination rows are also
++clamped by upstream's `fb_limit`. The ARM writes nothing in the window until
++a driver has published `REQ_MAGIC`. It clears a stale `REQ_MAGIC` when the
++core loads.
++
++**Polling.** The thread spins (`sched_yield`) for 5ms after each op, sleeps
++200µs when the driver is attached but idle, and sleeps 20ms when no driver is
++attached. The driver's attach timeout covers the 20ms sleep.
++
++## Status
++
++- Host test: 241 checks pass under ASan/UBSan. They cover the handshake,
++  byte-swapped refusal, every op in 8/16/32-bit with masks, overlapping
++  copies in all directions, minterms, template/pattern draw modes, P2C/P2D,
++  lines, and out-of-window rejection.
++- `MiSTerZZ.card` (25.9KB) and `MiSTerZZInfo` build with bebbo GCC 6.5. A full
++  `MiSTer` binary builds with the module, with 0 warnings from it.
++- **Not yet run on hardware.** Bring-up checks: the attach message in the
++  MiSTer log, `MiSTerZZInfo` output, P96 test screen and window dragging in
++  each format, text rendering, and the `ops` counter climbing.
++
++## Possible next steps
++
++- RTL: drop `sel_rtg` from the CPU cache (feed `cache_inhibit`, but not
++  `ddr_swap`, from it). Then the driver can lose its `CacheClearU()` calls,
++  and ops become much cheaper for the 68k.
++- Queue several ops per kick, for asynchronous blits. This needs `WaitBlitter`
++  to wait for real, and per-slot GFXData.
++- Use a cached ARM mapping (kernel helper, or `u-dma-buf`-style reserved
++  memory) for much faster pixel loops.
++- Map the ZZ9000 hardware-sprite ops onto a MiSTer OSD/scaler sprite, if the
++  core ever grows one.
+diff --git a/zz9000/UPSTREAM.md b/zz9000/UPSTREAM.md
+index f012c76b..0fc9b7bd 100644
+--- a/zz9000/UPSTREAM.md
++++ b/zz9000/UPSTREAM.md
+@@ -12,3 +12,29 @@ commits (use `git log -p -- zz9000/` to see every change against upstream).
+ | `mister/zz9000os/gfx.c`, `gfx.h`, `zz_video_modes.h`, `dma_rtg.c` | https://github.com/BlitterStudio/zz9000-firmware | `ZZ9000_proto.sdk/ZZ9000OS/src/` | `8778ef3b21698cc78a28b857b587988a07294885` (2026-10-08) |
+ 
+ License: GPL-3.0-or-later (both repositories).
++
++## Local changes
++
++`amiga/rtg/mntgfx-gcc.c` (→ `MiSTerZZ.card`):
++- `FindCard` finds the Minimig Z3 RTG board (`$139C/$30`) instead of a ZZ9000.
++  It points `MemoryBase` at the framebuffer and the rtg.v regs at board +
++  `$800100`, gives P96 the bottom `$7C0000`, and does the mailbox handshake
++  with the MiSTer binary.
++- `InitCard` uses the MiSTer.card identity/limits, sets `BIF_BLITTER` only
++  when the ARM attached, and installs no ZZ9000-only hooks (sprite, capture,
++  split, DPMS, off-screen bitmaps, PIP/YUV).
++- Display hooks (`SetGC`, `SetPanning`, `SetColorArray`, `SetDAC`,
++  `SetSwitch`, pixel clock, vsync) program rtg.v the way MiSTer.card does.
++- Accelerated hooks: unchanged upstream Z3 paths. Only these differ:
++  - doorbell `zzwrite16(&registers->blitter_dma_op, op)` → `mister_kick(b, op)`;
++  - `mnt_colormode()` → `blit_colormode()`, which falls back to software when
++    no ARM is attached;
++  - staging-size checks for template/planar ops (MiSTer staging is 232KB).
++- Pixel formats: CLUT, R5G6B5PC, R8G8B8A8 (+ B8G8R8 in software). Pitches
++  are rounded to whole longwords.
++
++`mister/zz9000os/dma_rtg.c`: reads GFXData from a private snapshot instead of
++the Zynq aperture, range-checks every Amiga-supplied offset, uses `uintptr_t`
++pointer math, and drops the display/sprite/palette/YUV/overlay ops.
++`gfx.c`, `gfx.h` and `zz_video_modes.h` are unchanged. `video.h` is a MiSTer
++shim.
+diff --git a/zz9000/amiga/.gitignore b/zz9000/amiga/.gitignore
+new file mode 100644
+index 00000000..b46b11ee
+--- /dev/null
++++ b/zz9000/amiga/.gitignore
+@@ -0,0 +1,2 @@
++build/
++sdk/
+diff --git a/zz9000/amiga/Makefile b/zz9000/amiga/Makefile
+new file mode 100644
+index 00000000..2e1e9977
+--- /dev/null
++++ b/zz9000/amiga/Makefile
+@@ -0,0 +1,35 @@
++# MiSTerZZ.card - ZZ9000.card built for the MiSTer Minimig Z3 RTG board.
++#
++#   export PATH=/opt/amiga/bin:$PATH
++#   make p96-sdk      # once: fetch the Picasso96 developer headers into sdk/
++#   make              # -> build/MiSTerZZ.card, build/MiSTerZZInfo
++#
++# Same compiler flags as the official rtg/build.sh.
++
++CC       := m68k-amigaos-gcc
++P96_URL  := http://wiki.icomp.de/w/images/e/e9/Develop.lha
++P96_INC  ?= sdk/Picasso96Develop/Include
++CFLAGS   := -m68020 -mtune=68020-60 -O2 -Iinclude -I$(P96_INC) -noixemul \
++            -Wall -Wextra -Wno-unused-parameter -fomit-frame-pointer -nostartfiles
++SRC      := rtg/mntgfx-gcc.c
++DEPS     := $(wildcard rtg/*.h include/*.h) ../common/mister_zz9000.h
++
++all: build/MiSTerZZ.card build/MiSTerZZInfo
++
++build/MiSTerZZ.card: $(SRC) $(DEPS)
++	@test -f $(P96_INC)/libraries/Picasso96.h || { echo "Picasso96 headers missing: run 'make p96-sdk' or set P96_INC"; exit 1; }
++	@mkdir -p build
++	$(CC) $(SRC) $(CFLAGS) -o $@ -lamiga
++
++build/MiSTerZZInfo: tools/MiSTerZZInfo.c ../common/mister_zz9000.h
++	@mkdir -p build
++	$(CC) -m68020 -O2 -noixemul -Wall -o $@ $<
++
++p96-sdk:
++	mkdir -p sdk
++	cd sdk && { test -f Develop.lha || wget -q $(P96_URL) -O Develop.lha; } && lha xq Develop.lha
++
++clean:
++	rm -rf build
++
++.PHONY: all p96-sdk clean
+diff --git a/zz9000/amiga/rtg/mntgfx-gcc.c b/zz9000/amiga/rtg/mntgfx-gcc.c
+index 81536281..23559e8b 100644
+--- a/zz9000/amiga/rtg/mntgfx-gcc.c
++++ b/zz9000/amiga/rtg/mntgfx-gcc.c
+@@ -9,6 +9,17 @@
+  *
+  * More Info: https://mntre.com/zz9000
+  *
++ * MiSTer Minimig port (MiSTerZZ.card), 2026: drives the Minimig Z3 RTG
++ * board (mfr 0x139C, product 0x30) instead of a ZZ9000. The accelerated
++ * P96 hooks below are the official ZZ9000 Zorro III code paths, unchanged
++ * except for the doorbell: where the ZZ9000 driver writes the op number to
++ * the card's blitter_dma_op register, this one hands it to the ZZ9000OS
++ * blitter running inside the MiSTer main binary via a mailbox at the top of
++ * the RTG framebuffer (see ../../common/mister_zz9000.h). Display control
++ * (mode, panning, CLUT, pixel format) goes to the core's own rtg.v
++ * registers, as MiSTer.card does. ZZ9000-only hardware (video capture,
++ * hardware sprite, screen split, PIP, DPMS, ARM SDK) is not offered.
++ *
+  * SPDX-License-Identifier: GPL-3.0-or-later
+  * GNU General Public License v3.0 or later
+  *
+@@ -42,6 +53,7 @@
+ #include "overlay_feature.h"
+ #include "zz9000_hw.h"
+ #include "videocap_mode.h"
++#include "../../common/mister_zz9000.h"
+ #include <clib/Picasso96_protos.h>
+ #include <inline/Picasso96.h>
+ 
+@@ -67,12 +79,16 @@ struct DOSBase;
+ 
+ #define DEVICE_VERSION 2
+ #define DEVICE_REVISION 13
+-#define REQUIRED_FW_VERSION_MAJOR 2
+-#define REQUIRED_FW_VERSION_MINOR 0
+ #define DEVICE_PRIORITY 0
+-#define DEVICE_ID_STRING "$VER: ZZ9000.card+blitter " XSTR(DEVICE_VERSION) "." XSTR(DEVICE_REVISION) " " DEVICE_DATE
+-#define DEVICE_NAME "ZZ9000.card"
+-#define DEVICE_DATE "(29.09.2026)"
++#define DEVICE_ID_STRING "$VER: MiSTerZZ.card " XSTR(DEVICE_VERSION) "." XSTR(DEVICE_REVISION) " " DEVICE_DATE " ZZ9000.card port for MiSTer Minimig"
++#define DEVICE_NAME "MiSTerZZ.card"
++#define DEVICE_DATE "(09.10.2026)"
++
++/* Firmware revision the MiSTer blitter answers as (major<<8|minor). 2.0 is
++ * the oldest the ZZ9000 driver supports and, deliberately, older than every
++ * optional feature gate below (off-screen bitmaps 2.4, PIP 2.6, DPMS 2.7):
++ * the MiSTer side implements the plain 2.0 blitter op set only. */
++#define MISTER_ZZ_FWREV 0x0200
+ 
+ int __attribute__((no_reorder)) _start()
+ {
+@@ -112,13 +128,15 @@ __saveds struct GFXBase* InitLib(__REGA6(struct ExecBase *sysbase),
+ #define MEMORY_CLOCK_HZ 100000000
+ 
+ static struct GFXBase *_gfxbase;
+-char *gfxname = "ZZ9000";
++char *gfxname = "MiSTerZZ";
+ char dummies[128];
+ 
+ #define CARDFLAG_ZORRO_3 1
+-// Place scratch area right after framebuffer? Might be a horrible idea.
+-#define Z3_GFXDATA_ADDR	(0x3200000 - 0x10000)
+-#define Z3_TEMPLATE_ADDR (0x3210000 - 0x10000)
++/* GFXData and the template/planar staging area: the reserved top of the
++ * Minimig RTG framebuffer, shared with the MiSTer side (MemoryBase-relative,
++ * like the ZZ9000's own scratch area). */
++#define Z3_GFXDATA_ADDR  MZZ_GFXDATA_OFFSET
++#define Z3_TEMPLATE_ADDR MZZ_TEMPLATE_OFFSET
+ #define ZZ_CARD_DATA_GFXDATA 0
+ #define ZZ_CARD_DATA_VCAP_MODE 1
+ #define ZZ_CARD_DATA_NSVSYNC 2
+@@ -134,31 +152,37 @@ char dummies[128];
+ #define ZZ_CARD_DATA_FW_CAPABILITIES 12
+ /* Refused SetGC requests must not reach scanout through later panning. */
+ #define ZZ_CARD_DATA_GC_REJECTED 13
++/* MiSTer: rtg.v control registers (board + $800100) */
++#define ZZ_CARD_DATA_MISTER_REGS 14
++/* MiSTer: 1 while the ARM blitter is attached and answering */
++#define ZZ_CARD_DATA_MISTER_ACCEL 15
+ /* first firmware whose surface allocator really frees (major<<8|minor) */
+ #define OFFSCREEN_BITMAPS_MIN_FWREV 0x0204
+ /* first firmware with OP_VIDEO_OVERLAY + the shadow-scanout compositor */
+ #define VIDEO_OVERLAY_MIN_FWREV 0x0206
+ /* first firmware with CARD_FEATURE_DPMS + formatter sync gating */
+ #define DPMS_MIN_FWREV 0x0207
+-#define MNT_MANUFACTURER 0x6d6e
+ #define RGBFMT_BIT(format) (1UL << (format))
+ #define ZZ_RGBFMT_NONE     0
+ #define ZZ_RGBFMT_CLUT     1
+-#define ZZ_RGBFMT_BGRA     9
+-#define ZZ_RGBFMT_R5G6B5   10
+-#define ZZ_RGBFMT_R5G5B5   11
++#define ZZ_RGBFMT_B8G8R8   3
++#define ZZ_RGBFMT_R5G6B5PC 4
++#define ZZ_RGBFMT_R8G8B8A8 8
+ 
+ /*
+- * Only advertise formats the firmware/video formatter interprets natively.
+- * RGBA and the PC/BGR 15-bit variants use different byte or component order,
+- * but the firmware only has one 32-bit mode and one RGB555 mode.
++ * MiSTer: advertise the formats MiSTer.card has proven on the Minimig RTG
++ * scanout (rtg.v FORMAT codes in mister_format[] below). The ZZ9000 blitter
++ * itself is byte-order agnostic within a pixel size, so R5G6B5PC runs on its
++ * 16-bit paths and R8G8B8A8 on its 32-bit paths (alpha sits in the last
++ * byte, exactly where the ZZ9000's BGRA keeps it). 24-bit B8G8R8 has no
++ * ZZ9000 blitter mode and is drawn by Picasso96's software defaults.
+  */
+ #define ZZ_SUPPORTED_RGB_FORMATS \
+ 	(RGBFMT_BIT(ZZ_RGBFMT_NONE) | \
+ 	 RGBFMT_BIT(ZZ_RGBFMT_CLUT) | \
+-	 RGBFMT_BIT(ZZ_RGBFMT_BGRA) | \
+-	 RGBFMT_BIT(ZZ_RGBFMT_R5G6B5) | \
+-	 RGBFMT_BIT(ZZ_RGBFMT_R5G5B5))
++	 RGBFMT_BIT(ZZ_RGBFMT_B8G8R8) | \
++	 RGBFMT_BIT(ZZ_RGBFMT_R5G6B5PC) | \
++	 RGBFMT_BIT(ZZ_RGBFMT_R8G8B8A8))
+ 
+ #ifndef CDF_CONFIGME
+ #define CDF_CONFIGME (1 << 1)
+@@ -206,6 +230,152 @@ static inline volatile struct GFXData *zz_gfxdata(struct BoardInfo *b) {
+ 	return (volatile struct GFXData *)b->CardData[ZZ_CARD_DATA_GFXDATA];
+ }
+ 
++/* ---- MiSTer Minimig RTG board ------------------------------------------- */
++
++/* rtg.v control registers, offsets from board + $800100 (see MiSTer.card) */
++#define MISTER_REG_ADDRESS 0x00   /* 32-bit: scanout address, ARM physical */
++#define MISTER_REG_FORMAT  0x04
++#define MISTER_REG_ENABLE  0x06
++#define MISTER_REG_HSIZE   0x08
++#define MISTER_REG_VSIZE   0x0A
++#define MISTER_REG_STRIDE  0x0C
++#define MISTER_REG_ID      0x0E   /* reads $5001 */
++#define MISTER_REG_PALETTE 0x300  /* 256 x 32-bit $00RRGGBB */
++#define MISTER_RTG_ID      0x5001
++
++/* rtg.v FORMAT per RGBFTYPE, MiSTer.card's SetDAC table:
++ * [2:0] 011=8bpp CLUT 100=16bpp 101=24bpp 110=32bpp, [3] 1555,
++ * [4] BGR, [5] byte swap. */
++static const UWORD mister_format[] = {
++	3, 3 + 32, 5, 5 + 16 + 32, 4 + 16 + 32, 4 + 8, 6, 6 + 16,
++	6 + 32, 6 + 16, 4, 4 + 8, 4, 4 + 8 + 16,
++};
++
++/* ARM-side blitter timeouts, in mailbox polls (each poll is a CacheClearU()
++ * plus a Zorro III read, so at least ~2us). Attach waits for the MiSTer
++ * thread's 20ms no-driver sleep; an op waits long only once the ARM has
++ * taken it (a full-screen 32-bit copy through /dev/mem is tens of ms). */
++#define MISTER_ATTACH_POLLS   400000UL
++#define MISTER_UNTAKEN_POLLS  100000UL
++#define MISTER_TAKEN_POLLS   2500000UL
++
++static ULONG mister_seq;
++
++static inline volatile UWORD *mister_regs(struct BoardInfo *b) {
++	return (volatile UWORD *)b->CardData[ZZ_CARD_DATA_MISTER_REGS];
++}
++
++static inline volatile ULONG *mister_mbox_field(struct BoardInfo *b, ULONG field) {
++	return (volatile ULONG *)((UBYTE *)b->MemoryBase + MZZ_MBOX_OFFSET + field);
++}
++
++static inline BOOL mister_accel(struct BoardInfo *b) {
++	return b && b->CardData[ZZ_CARD_DATA_MISTER_ACCEL];
++}
++
++static inline ULONG mister_mbox_read(struct BoardInfo *b, ULONG field) {
++	/* The FPGA CPU cache holds RTG window lines: drop them before every
++	 * read of a word the ARM writes. */
++	CacheClearU();
++	return *mister_mbox_field(b, field);
++}
++
++/* The ZZ9000 doorbell. Upstream writes the op to blitter_dma_op and the
++ * card's firmware runs it before the Zorro cycle completes; here the op
++ * goes to the MiSTer-side ZZ9000OS blitter through the mailbox and this
++ * waits for it, so callers keep the same synchronous semantics (and
++ * WaitBlitter() has nothing left to wait for). */
++static void mister_kick(struct BoardInfo *b, UWORD op) {
++	ULONG seq, polls = 0;
++
++	if (!mister_accel(b))
++		return;
++
++	seq = ++mister_seq;
++	*mister_mbox_field(b, MZZ_MB_OP) = op;
++	*mister_mbox_field(b, MZZ_MB_KICK) = seq;
++
++	for (;;) {
++		if (mister_mbox_read(b, MZZ_MB_DONE) == seq)
++			break;
++		polls++;
++		if (polls > MISTER_TAKEN_POLLS ||
++		    (polls > MISTER_UNTAKEN_POLLS &&
++		     *mister_mbox_field(b, MZZ_MB_TAKEN) != seq)) {
++			/* The MiSTer side is gone (binary replaced/killed): stop
++			 * offloading. Every hook falls back to the P96 software
++			 * defaults from here on; this one op is lost. */
++			KPrintF("MiSTerZZ.card: ARM blitter timed out on op %ld, acceleration off\n", (LONG)op);
++			b->CardData[ZZ_CARD_DATA_MISTER_ACCEL] = 0;
++			break;
++		}
++	}
++	/* An interrupt between the last clear and DONE could have cached
++	 * pre-blit pixels; make sure the CPU sees the ARM's result. */
++	CacheClearU();
++}
++
++/* Handshake with the MiSTer binary (protocol in mister_zz9000.h).
++ * Returns TRUE if the ARM blitter attached. */
++static BOOL mister_attach(struct BoardInfo *b) {
++	volatile ULONG *mb = mister_mbox_field(b, 0);
++	ULONG session, polls, i;
++
++	for (i = 0; i < MZZ_MB_SIZE / 4; i++)
++		mb[i] = 0;
++	memset((void *)zz_gfxdata(b), 0, sizeof(struct GFXData));
++
++	/* Any value that differs from the previous boot's will do. */
++	session = (ULONG)SysBase->VBlankFrequency << 24 ^ (ULONG)SysBase->IdleCount ^
++		(ULONG)SysBase->DispCount ^ ((ULONG)b << 4) ^ 0x5A5A0000UL;
++	mister_seq = 0;
++	mb[MZZ_MB_SESSION / 4] = session;
++	mb[MZZ_MB_KICK / 4] = 0;
++	mb[MZZ_MB_REQ_MAGIC / 4] = MZZ_REQ_MAGIC;
++
++	for (polls = 0; polls < MISTER_ATTACH_POLLS; polls++) {
++		if (mister_mbox_read(b, MZZ_MB_ACK_MAGIC) == MZZ_ACK_MAGIC &&
++		    mister_mbox_read(b, MZZ_MB_ACK_SESSION) == session) {
++			ULONG version = mister_mbox_read(b, MZZ_MB_VERSION);
++			ULONG caps = mister_mbox_read(b, MZZ_MB_CAPS);
++			if (version != MZZ_PROTOCOL_VERSION ||
++			    (caps & MZZ_CAPS_V1) != MZZ_CAPS_V1) {
++				KPrintF("MiSTerZZ.card: MiSTer blitter protocol %ld caps %lx unsupported\n",
++					(LONG)version, (ULONG)caps);
++				return FALSE;
++			}
++			return TRUE;
++		}
++	}
++	KPrintF("MiSTerZZ.card: no MiSTer blitter answered (old MiSTer binary?), software rendering\n");
++	return FALSE;
++}
++
++/* Like mnt_colormode(), but NO_USE once the ARM blitter is unavailable, so
++ * every accelerated hook takes its existing "unsupported format" exit into
++ * the P96 software default. */
++static inline uint16_t blit_colormode(struct BoardInfo *b, UWORD format);
++
++static inline uint32_t mister_bytes_per_pixel(RGBFTYPE format);
++
++/* Bytes per row of a card bitmap and of the scanout. Rounded up to whole
++ * longwords: the ZZ9000 blitter addresses rows in 32-bit words and ignores
++ * template/pattern ops on any other pitch. */
++static inline UWORD mister_pitch(UWORD width, RGBFTYPE format) {
++	return (UWORD)(((ULONG)width * mister_bytes_per_pixel(format) + 3) & ~3UL);
++}
++
++static inline uint32_t mister_bytes_per_pixel(RGBFTYPE format) {
++	switch (format) {
++	case ZZ_RGBFMT_NONE:
++	case ZZ_RGBFMT_CLUT:     return 1;
++	case ZZ_RGBFMT_B8G8R8:   return 3;
++	case ZZ_RGBFMT_R5G6B5PC: return 2;
++	case ZZ_RGBFMT_R8G8B8A8: return 4;
++	default:                 return 0;
++	}
++}
++
+ static inline BOOL zz_z2_layout_active(struct BoardInfo *b) {
+ 	return b && !(b->CardFlags & CARDFLAG_ZORRO_3) &&
+ 		b->CardData[ZZ_CARD_DATA_APERTURE_INFO] != 0 &&
+@@ -229,11 +399,11 @@ static const uint16_t rtg_to_mnt[] = {
+ 	MNTVA_COLOR_8BIT,		// 0x01 -- 8BPP CLUT
+ 	MNTVA_COLOR_NO_USE,		// 0x02 -- 24BPP RGB
+ 	MNTVA_COLOR_NO_USE,		// 0x03 -- 24BPP BGR
+-	MNTVA_COLOR_NO_USE,		// 0x04 -- 16BPP R5G6B5PC
++	MNTVA_COLOR_16BIT565,	// 0x04 -- 16BPP R5G6B5PC (MiSTer)
+ 	MNTVA_COLOR_NO_USE,		// 0x05 -- 15BPP R5G5B5PC
+ 	MNTVA_COLOR_NO_USE,		// 0x06 -- 32BPP ARGB
+ 	MNTVA_COLOR_NO_USE,		// 0x07 -- 32BPP ABGR
+-	MNTVA_COLOR_NO_USE,		// 0x08 -- 32BPP RGBA
++	MNTVA_COLOR_32BIT,		// 0x08 -- 32BPP RGBA (MiSTer)
+ 	MNTVA_COLOR_32BIT,		// 0x09 -- 32BPP BGRA
+ 	MNTVA_COLOR_16BIT565,	// 0x0A -- 16BPP R5G6B5
+ 	MNTVA_COLOR_15BIT,		// 0x0B -- 15BPP R5G5B5
+@@ -255,6 +425,10 @@ static inline uint16_t mnt_colormode(UWORD format) {
+ 	return MNTVA_COLOR_NO_USE;
+ }
+ 
++static inline uint16_t blit_colormode(struct BoardInfo *b, UWORD format) {
++	return mister_accel(b) ? mnt_colormode(format) : MNTVA_COLOR_NO_USE;
++}
++
+ static inline uint16_t panning_colormode(uint16_t colormode) {
+ 	return (colormode == MNTVA_COLOR_15BIT) ? MNTVA_COLOR_16BIT565 : colormode;
+ }
+@@ -772,225 +946,68 @@ ULONG ExtFuncLib(void)
+ int __attribute__((used)) FindCard(__REGA0(struct BoardInfo* b)) {
+ 	struct ConfigDev* cd = NULL;
+ 	struct ExpansionBase *ExpansionBase = NULL;
+-	struct DOSBase *DOSBase = NULL;
+-	struct IntuitionBase *IntuitionBase = NULL;
+ 	struct ExecBase *SysBase = *(struct ExecBase **)4L;
+-	LONG zorro_version = 0;
+-	LONG fwrev_major = 0;
+-	LONG fwrev_minor = 0;
+-	LONG fwrev = 0;
+-	UWORD fw_caps = 0;
+-	uint32_t aperture_info = 0;
+-	enum ZZApertureNegotiation aperture_status = ZZ_APERTURE_LEGACY;
+-	struct ZZApertureLayout aperture_layout;
+ 	int result = 0;
+-#ifdef DEBUG
+-	LONG hwrev = 0;
+-#endif
+ 
+ 	LOADLIB(ExpansionBase, "expansion.library");
+-	LOADLIB(DOSBase, "dos.library");
+-	LOADLIB(IntuitionBase, "intuition.library");
+ 
+-	zorro_version = 0;
+ 	b->CardFlags = 0;
+ 	b->CardData[ZZ_CARD_DATA_GFXDATA] = 0;
+ 	b->CardData[ZZ_CARD_DATA_VCAP_MODE] = ZZ_VMODE_800x600;
+ 	b->CardData[ZZ_CARD_DATA_NSVSYNC] = 0;
+-	b->CardData[ZZ_CARD_DATA_MONITOR_SWITCH] = 1;
++	b->CardData[ZZ_CARD_DATA_MONITOR_SWITCH] = 0;
+ 	b->CardData[ZZ_CARD_DATA_DISPLAY_ENABLED] = 1;
+ 	b->CardData[ZZ_CARD_DATA_SECONDARY_PALETTE] = 0;
+-	b->CardData[ZZ_CARD_DATA_OFFSCREEN_BITMAPS] = 1;
+-	b->CardData[ZZ_CARD_DATA_VIDEO_OVERLAY] = 1;
++	b->CardData[ZZ_CARD_DATA_OFFSCREEN_BITMAPS] = 0;
++	b->CardData[ZZ_CARD_DATA_VIDEO_OVERLAY] = 0;
+ 	b->CardData[ZZ_CARD_DATA_APERTURE_INFO] = 0;
+ 	b->CardData[ZZ_CARD_DATA_TEMPLATE_OFFSET] = 0;
+ 	b->CardData[ZZ_CARD_DATA_PIP_OFFSET] = 0;
+ 	b->CardData[ZZ_CARD_DATA_PIP_SIZE] = 0;
+ 	b->CardData[ZZ_CARD_DATA_FW_CAPABILITIES] = 0;
+ 	b->CardData[ZZ_CARD_DATA_GC_REJECTED] = 0;
++	b->CardData[ZZ_CARD_DATA_MISTER_REGS] = 0;
++	b->CardData[ZZ_CARD_DATA_MISTER_ACCEL] = 0;
+ 	zz_overlay_hooks_enabled = FALSE;
+ 	memset(&zz_z2_pip_request, 0, sizeof(zz_z2_pip_request));
+ 	zz_z2_pip_bitmap = NULL;
+-	if ((cd = find_unconfigured_configdev(ExpansionBase, MNT_MANUFACTURER, ZZ9000_PRODUCT_Z3))) zorro_version = 3;
+-	else if ((cd = find_unconfigured_configdev(ExpansionBase, MNT_MANUFACTURER, ZZ9000_PRODUCT_Z2))) zorro_version = 2;
+-
+-	// Find Z3 or Z2 model
+-	if (zorro_version>=2) {
+-
+-		b->RegisterBase = (void *)(cd->cd_BoardAddr);
+-		b->MemoryBase = (uint8_t*)(cd->cd_BoardAddr)+0x10000;
+-		zz_card_window_size = (ULONG)cd->cd_BoardSize - 0x10000;
+-		fwrev = ((volatile uint16_t*)b->RegisterBase)[ZZ_REG_FW_VERSION/2];
+-		fw_caps = ((volatile uint16_t*)b->RegisterBase)[ZZ_REG_FW_CAPABILITIES/2];
+-		b->CardData[ZZ_CARD_DATA_FW_CAPABILITIES] = fw_caps;
+-		if (zorro_version == 2) {
+-			/* These are BOARD offsets.  RegisterBase is cd_BoardAddr, not
+-			 * the direct-register bank at +0x1000. Re-read a descriptor
+-			 * that fails validation before giving up: a marginal Z2 bus
+-			 * can glitch one halfword of the back-to-back pair (fixed in
+-			 * FPGA for v2.8.1; this also recovers deployed bitstreams).
+-			 * Fail closed on an unconfirmed descriptor too: a valid-
+-			 * looking but wrong generation must not be acknowledged. */
+-			int aperture_verified = 0;
+-			aperture_info = zz9000_read_z2_aperture_verified(
+-				(ULONG)b->RegisterBase, (uint32_t)cd->cd_BoardSize,
+-				&fw_caps, &aperture_verified, NULL);
+-			/* Store the capability view the verification actually
+-			 * used, so downstream feature gates match the negotiated
+-			 * layout decision. */
+-			b->CardData[ZZ_CARD_DATA_FW_CAPABILITIES] = fw_caps;
+-			aperture_status = zz_z2_aperture_negotiate(aperture_info,
+-				(uint32_t)cd->cd_BoardSize, fw_caps, &aperture_layout);
+-			if (!aperture_verified ||
+-				aperture_status == ZZ_APERTURE_INVALID) {
+-				KPrintF("ZZ9000.card: %s Z2 aperture descriptor %08lx for %08lx-byte window\n",
+-					aperture_verified ? "invalid" : "unconfirmed",
+-					(ULONG)aperture_info, (ULONG)cd->cd_BoardSize);
+-				goto cleanup;
+-			}
+-			if (aperture_status == ZZ_APERTURE_VALID) {
+-				b->MemorySize = aperture_layout.framebuffer.size;
+-				b->CardData[ZZ_CARD_DATA_APERTURE_INFO] = aperture_info;
+-				b->CardData[ZZ_CARD_DATA_TEMPLATE_OFFSET] =
+-					zz_aperture_memory_offset(aperture_layout.template_scratch.base);
+-				b->CardData[ZZ_CARD_DATA_PIP_OFFSET] = aperture_layout.pip.size ?
+-					zz_aperture_memory_offset(aperture_layout.pip.base) : 0;
+-				b->CardData[ZZ_CARD_DATA_PIP_SIZE] = aperture_layout.pip.size;
+-				b->CardData[ZZ_CARD_DATA_GFXDATA] =
+-					(ULONG)((uint8_t *)b->MemoryBase +
+-					b->CardData[ZZ_CARD_DATA_TEMPLATE_OFFSET]);
+-				memset((void *)b->CardData[ZZ_CARD_DATA_GFXDATA], 0,
+-					sizeof(struct GFXData));
+-			} else {
+-				/* Exact pre-handshake ownership: framebuffer, 64 KiB
+-				 * template, 64 KiB SDK host window, final 64 KiB audio. */
+-				b->MemorySize = cd->cd_BoardSize-0x40000;
+-			}
+-		} else {
+-			/*
+-			 * End P96-owned VRAM exactly where the firmware SDK shared
+-			 * heap begins. The previous 0x02ff0000 size reached ARM
+-			 * 0x031f0000 and overlapped the first 0x1f0000 bytes of that
+-			 * heap; streaming PCM could therefore paint RTG pixels while
+-			 * P96 writes corrupted audio samples in the opposite direction.
+-			 */
+-			b->MemorySize = ZZ_Z3_P96_MEMORY_SIZE;
+-			b->CardFlags |= CARDFLAG_ZORRO_3;
+-			volatile struct GFXData *gd = (struct GFXData*)(((uint32_t)b->MemoryBase) + (uint32_t)Z3_GFXDATA_ADDR);
+-			b->CardData[ZZ_CARD_DATA_GFXDATA] = (ULONG)gd;
+-			memset((void *)gd, 0x00, sizeof(struct GFXData));
+-			/* Announce the conditional-clear protocol: after this
+-			 * token the firmware honors u8_user[3] as a per-allocation
+-			 * no-clear flag (see ZZ_AllocBitMap). Older firmware
+-			 * ignores the write; the write is Z3-only because only
+-			 * Z3 issues ACC_OP_ALLOC_SURFACE. */
+-			zzwrite16((uint16_t *)((uint8_t *)b->RegisterBase +
+-				REG_ZZ_ALLOC_CLEAR_PROTOCOL),
+-				ZZ_REG_ZZ_ALLOC_CLEAR_TOKEN);
+-		}
+-		b->MemorySpaceBase = b->MemoryBase;
+-		b->MemorySpaceSize = b->MemorySize;
+-	#ifdef DEBUG
+-		hwrev = ((uint16_t*)b->RegisterBase)[0];
+-	#endif
+-		fwrev_major = fwrev >> 8;
+-		fwrev_minor = fwrev & 0xFF;
+-
+-		KPrintF(device_id_string);
+-		KPrintF("ZZ9000.card: MNT ZZ9000 found. Zorro version %ld.\n", zorro_version);
+-#ifdef DEBUG
+-		KPrintF("ZZ9000.card: HW Revision: %ld.\n", hwrev);
+-#endif
+-		KPrintF("ZZ9000.card: FW Revision Major: %ld.\n", fwrev_major);
+-		KPrintF("ZZ9000.card: FW Revision Minor: %ld.\n", fwrev_minor);
+-
+-		if (fwrev_major < REQUIRED_FW_VERSION_MAJOR ||
+-			(fwrev_major == REQUIRED_FW_VERSION_MAJOR && fwrev_minor < REQUIRED_FW_VERSION_MINOR)) {
+-			char *alert = "\x00\x14\x14ZZ9000.card 2.0 needs at least firmware (BOOT.bin) 2.0.\x00\x00";
+-			DisplayAlert(RECOVERY_ALERT, (APTR)alert, 52);
+-			goto cleanup;
+-		}
+ 
+-		MNTZZ9KRegs* registers = (MNTZZ9KRegs *)b->RegisterBase;
+-		UWORD cfg_present = 0;
+-		UWORD cfg_value;
+-
+-		/* Precedence: ENV variable, then ZZ9000.CFG (firmware 2.3+;
+-		 * the query reports "absent" on older firmware), then the
+-		 * built-in default. Without this the unconditional re-apply
+-		 * below would clobber the config file's cold-boot values.
+-		 *
+-		 * The default with neither ENV nor config is now 800x600
+-		 * 60 Hz - the monitor-compatible choice, and what the
+-		 * firmware, ZZTop and a freshly generated ZZ9000.CFG all
+-		 * default to. Older ZZ9000.card versions forced 720x576
+-		 * 50 Hz here; PAL-capable setups select it explicitly with
+-		 * `videocap_mode = pal` (ZZTop Settings) or the tooltype. */
+-		if (env_flag_exists(DOSBase, "ENV:ZZ9000-VCAP-800x600")) {
+-			b->CardData[ZZ_CARD_DATA_VCAP_MODE] = ZZ_VMODE_800x600;
+-		} else {
+-			cfg_value = zzcfg_query((ULONG)b->RegisterBase,
+-				ZZ_CFG_KEY_VIDEOCAP_MODE, &cfg_present);
+-			b->CardData[ZZ_CARD_DATA_VCAP_MODE] = zz_vcap_mode_sanitize(
+-				cfg_present ? cfg_value : ZZ_VMODE_800x600, fw_caps);
+-		}
++	/* Minimig Z3 RTG board: framebuffer at board offset 0, rtg.v regs+CLUT
++	 * at +$800000 (control block +$100). */
++	cd = find_unconfigured_configdev(ExpansionBase, MZZ_RTG_MANUFACTURER, MZZ_RTG_PRODUCT);
++	if (!cd) {
++		KPrintF("MiSTerZZ.card: Minimig Z3 RTG board not found!\n");
++		goto cleanup;
++	}
+ 
+-		if (env_flag_exists(DOSBase, "ENV:ZZ9000-NS-VSYNC")) {
+-			b->CardData[ZZ_CARD_DATA_VCAP_MODE] = ZZ_VMODE_800x600;
+-			b->CardData[ZZ_CARD_DATA_NSVSYNC] = 1;
+-		} else if (env_flag_exists(DOSBase, "ENV:ZZ9000-NS-VSYNC-NTSC")) {
+-			b->CardData[ZZ_CARD_DATA_VCAP_MODE] = ZZ_VMODE_800x600;
+-			b->CardData[ZZ_CARD_DATA_NSVSYNC] = 2;
+-		} else {
+-			cfg_value = zzcfg_query((ULONG)b->RegisterBase,
+-				ZZ_CFG_KEY_NS_VSYNC, &cfg_present);
+-			if (cfg_present && cfg_value <= 2)
+-				b->CardData[ZZ_CARD_DATA_NSVSYNC] = cfg_value;
+-		}
++	b->MemoryBase = (uint8_t *)cd->cd_BoardAddr;
++	b->RegisterBase = (void *)((uint8_t *)cd->cd_BoardAddr + MZZ_REGS_OFFSET);
++	b->CardData[ZZ_CARD_DATA_MISTER_REGS] =
++		(ULONG)((uint8_t *)cd->cd_BoardAddr + MZZ_REGS_OFFSET + MZZ_REG_SUB_OFFSET);
++	if (mister_regs(b)[MISTER_REG_ID / 2] != MISTER_RTG_ID) {
++		KPrintF("MiSTerZZ.card: RTG register block not answering\n");
++		goto cleanup;
++	}
+ 
+-		if (env_flag_exists(DOSBase, "ENV:ZZ9000-NO-OFFSCREEN")) {
+-			b->CardData[ZZ_CARD_DATA_OFFSCREEN_BITMAPS] = 0;
+-		} else {
+-			cfg_value = zzcfg_query((ULONG)b->RegisterBase,
+-				ZZ_CFG_KEY_OFFSCREEN_BITMAPS, &cfg_present);
+-			if (cfg_present)
+-				b->CardData[ZZ_CARD_DATA_OFFSCREEN_BITMAPS] = (cfg_value != 0);
+-		}
++	/* P96 owns the window below the shared mailbox/staging area. */
++	zz_card_window_size = MZZ_P96_MEMORY_SIZE;
++	b->MemorySize = MZZ_P96_MEMORY_SIZE;
++	b->MemorySpaceBase = b->MemoryBase;
++	b->MemorySpaceSize = MZZ_P96_MEMORY_SIZE;
++	b->CardFlags |= CARDFLAG_ZORRO_3;
++	b->CardData[ZZ_CARD_DATA_GFXDATA] = (ULONG)((uint8_t *)b->MemoryBase + Z3_GFXDATA_ADDR);
+ 
+-		if (env_flag_exists(DOSBase, "ENV:ZZ9000-NO-PIP")) {
+-			b->CardData[ZZ_CARD_DATA_VIDEO_OVERLAY] = 0;
+-		} else {
+-			cfg_value = zzcfg_query((ULONG)b->RegisterBase,
+-				ZZ_CFG_KEY_VIDEO_OVERLAY, &cfg_present);
+-			if (cfg_present)
+-				b->CardData[ZZ_CARD_DATA_VIDEO_OVERLAY] = (cfg_value != 0);
+-		}
++	b->CardData[ZZ_CARD_DATA_MISTER_ACCEL] = mister_attach(b);
+ 
+-		apply_vcap_settings(registers, (LONG)b->CardData[ZZ_CARD_DATA_VCAP_MODE]);
+-		if (!zz_vcap_mode_is_centered(
+-				(UWORD)b->CardData[ZZ_CARD_DATA_VCAP_MODE]))
+-			apply_nonstandard_vsync_settings(registers,
+-				(LONG)b->CardData[ZZ_CARD_DATA_NSVSYNC]);
+-
+-		cd->cd_Flags &= ~CDF_CONFIGME;
+-		reserved_cd = cd;
+-		if (zorro_version == 2 && aperture_status == ZZ_APERTURE_VALID) {
+-			/* Acknowledge only after P96 ownership is reserved and all
+-			 * aperture-relative pointers have been installed. */
+-			((volatile UWORD *)b->RegisterBase)
+-				[ZZ_REG_Z2_APERTURE_INFO_LO / 2] =
+-					zz_z2_aperture_ack_token(aperture_info);
+-		}
++	KPrintF(device_id_string);
++	KPrintF("MiSTerZZ.card: RTG board at %lx, ARM blitter %s\n",
++		(ULONG)cd->cd_BoardAddr, b->CardData[ZZ_CARD_DATA_MISTER_ACCEL] ? "on" : "off");
+ 
+-		result = 1;
+-		goto cleanup;
+-	} else {
+-		KPrintF("ZZ9000.card: MNT ZZ9000 not found!\n");
+-	}
++	cd->cd_Flags &= ~CDF_CONFIGME;
++	reserved_cd = cd;
++	result = 1;
+ 
+ cleanup:
+-	if (IntuitionBase) CloseLibrary((struct Library *)IntuitionBase);
+-	if (DOSBase) CloseLibrary((struct Library *)DOSBase);
+ 	if (ExpansionBase) CloseLibrary((struct Library *)ExpansionBase);
+ 
+ 	return result;
+@@ -1003,32 +1020,34 @@ int __attribute__((used)) InitCard(__REGA0(struct BoardInfo* b), __REGA1(char **
+ 
+ 	b->CardBase = (struct CardBase *)_gfxbase;
+ 	b->ExecBase = SysBase;
+-	b->BoardName = "ZZ9000";
+-	b->BoardType = BT_MNT_ZZ9000;
+-	b->PaletteChipType = PCT_MNT_ZZ9000;
+-	b->GraphicsControllerType = GCT_MNT_ZZ9000;
++	b->BoardName = "MiSTerZZ";
++	/* Same identity MiSTer.card reports, so existing P96 prefs/monitor
++	 * setups for the Minimig RTG board keep working. */
++	b->BoardType = 10;
++	b->PaletteChipType = 0;
++	b->GraphicsControllerType = 0;
+ 
+-	b->Flags |= BIF_GRANTDIRECTACCESS | BIF_HARDWARESPRITE | BIF_FLICKERFIXER | BIF_VGASCREENSPLIT | BIF_PALETTESWITCH | BIF_BLITTER | BIF_VIDEOCAPTURE;
+-	if (b->CardFlags & CARDFLAG_ZORRO_3)
+-		b->Flags |= BIF_CACHEMODECHANGE;
++	b->Flags |= BIF_GRANTDIRECTACCESS | BIF_INDISPLAYCHAIN | BIF_CACHEMODECHANGE;
++	if (mister_accel(b))
++		b->Flags |= BIF_BLITTER;
+ 
+ 	b->MoniSwitch = (UWORD)b->CardData[ZZ_CARD_DATA_MONITOR_SWITCH];
+ 	b->RGBFormats = ZZ_SUPPORTED_RGB_FORMATS;
+ 	b->SoftSpriteFlags = 0;
+ 	b->BitsPerCannon = 8;
++	b->MouseSaveBuffer = (UBYTE *)b->MemoryBase + MZZ_MOUSESAVE_OFFSET;
+ 
++	/* rtg.v: 12-bit HSIZE/VSIZE; limits as in MiSTer.card. */
+ 	for(i = 0; i < MAXMODES; i++) {
+-		b->MaxHorValue[i] = 8192;
+-		b->MaxVerValue[i] = 8192;
+-		b->MaxHorResolution[i] = 8192;
+-		b->MaxVerResolution[i] = 8192;
++		b->MaxHorValue[i] = 4095;
++		b->MaxVerValue[i] = 4095;
++		b->MaxHorResolution[i] = 2048;
++		b->MaxVerResolution[i] = 2048;
+ 		b->PixelClockCount[i] = 1;
+ 	}
+ 
+-	b->MemoryClock = MEMORY_CLOCK_HZ;
++	b->MemoryClock = 113440000;
+ 
+-	//b->AllocCardMem = (void *)NULL;
+-	//b->FreeCardMem = (void *)NULL;
+ 	b->SetSwitch = (void *)SetSwitch;
+ 	b->SetColorArray = (void *)SetColorArray;
+ 	b->SetDAC = (void *)SetDAC;
+@@ -1049,15 +1068,14 @@ int __attribute__((used)) InitCard(__REGA0(struct BoardInfo* b), __REGA1(char **
+ 	b->SetReadPlane = (void *)SetReadPlane;
+ 
+ 	b->WaitVerticalSync = (void *)WaitVerticalSync;
++	b->GetVSyncState = (void *)GetVSyncState;
+ 
++	/* Accelerated hooks: the official ZZ9000 Z3 paths. Installed even when
++	 * the ARM blitter did not attach - each one drops to the P96 software
++	 * default by itself in that case (blit_colormode / mister_accel). */
+ 	b->WaitBlitter = (void *)WaitBlitter;
+-
+-	//b->ScrollPlanar = (void *)NULL;
+-	//b->UpdatePlanar = (void *)NULL;
+-
+ 	b->BlitPlanar2Chunky = (void *)BlitPlanar2Chunky;
+ 	b->BlitPlanar2Direct = (void *)BlitPlanar2Direct;
+-
+ 	b->FillRect = (void *)FillRect;
+ 	b->InvertRect = (void *)InvertRect;
+ 	b->BlitRect = (void *)BlitRect;
+@@ -1065,81 +1083,11 @@ int __attribute__((used)) InitCard(__REGA0(struct BoardInfo* b), __REGA1(char **
+ 	b->BlitPattern = (void *)BlitPattern;
+ 	b->DrawLine = (void *)DrawLine;
+ 	b->BlitRectNoMaskComplete = (void *)BlitRectNoMaskComplete;
+-	//b->EnableSoftSprite = (void *)NULL;
+-
+-	//b->AllocCardMemAbs = (void *)NULL;
+-	b->SetSplitPosition = (void *)SetSplitPosition;
+-	//b->ReInitMemory = (void *)NULL;
+-	/* Stage A contract probe: logs + delegates to WriteYUVRectDefault
+-	 * (pure pass-through in release builds). See ZZ_WriteYUVRect. */
+-	b->WriteYUVRect = (void *)ZZ_WriteYUVRect;
+-	b->GetVSyncState = (void *)GetVSyncState;
+-	//b->GetVBeamPos = (void *)NULL;
+-	/* Older firmware ignores CARD_FEATURE_DPMS, so only advertise the P96
+-	 * callback when the formatter can actually gate HSync/VSync. */
+-	if (((volatile uint16_t*)b->RegisterBase)[0xC0/2] >= DPMS_MIN_FWREV)
+-		b->SetDPMSLevel = (void *)SetDPMSLevel;
+-	//b->ResetChip = (void *)NULL;
+-	/* General off-screen bitmaps remain Z3-only. Requires firmware 2.4+:
+-	 * its surface allocator actually
+-	 * frees, while older firmware bump-allocates with a no-op free and
+-	 * would leak VRAM on every bitmap free. Kill switch on capable
+-	 * firmware: ENV:ZZ9000-NO-OFFSCREEN, the ZZ9000.CFG
+-	 * offscreen_bitmaps key (both read in FindCard), or the
+-	 * OFFSCREENBITMAPS tooltype, which wins over both.  The bounded Z2 PIP
+-	 * path installs these hooks separately below, but ZZ_AllocBitMap refuses
+-	 * every Z2 request outside CreateFeature's managed-source allocation. */
+-	{
+-		UWORD fwrev = ((volatile uint16_t*)b->RegisterBase)[0xC0/2];
+-		BOOL offscreen = (BOOL)b->CardData[ZZ_CARD_DATA_OFFSCREEN_BITMAPS];
+-		const char *value = tooltype_value(tool_types, "OFFSCREENBITMAPS");
+-		if (value)
+-			offscreen = !value_is_false(value);
+-		if (offscreen && fwrev >= OFFSCREEN_BITMAPS_MIN_FWREV &&
+-				(b->CardFlags & CARDFLAG_ZORRO_3)) {
+-			b->AllocBitMap = (void *)ZZ_AllocBitMap;
+-			b->FreeBitMap = (void *)ZZ_FreeBitMap;
+-			b->GetBitMapAttr = (void *)ZZ_GetBitMapAttr;
+-		}
+-	}
+ 
+-	b->SetSprite = (void *)SetSprite;
+-	b->SetSpritePosition = (void *)SetSpritePosition;
+-	b->SetSpriteImage = (void *)SetSpriteImage;
+-	b->SetSpriteColor = (void *)SetSpriteColor;
+-
+-	/* P96 video window (PIP): Features API + BIF_VIDEOWINDOW. Requires
+-	 * firmware 2.6+ (OP_VIDEO_OVERLAY compositor) and the off-screen
+-	 * bitmap hooks (CreateFeature allocates the YUV source through
+-	 * AllocBitMap). Kill switch: ENV:ZZ9000-NO-PIP, the ZZ9000.CFG
+-	 * video_overlay key (both read in FindCard), or the VIDEOPIP
+-	 * tooltype, which wins over both. */
+-	{
+-		UWORD fwrev = ((volatile uint16_t*)b->RegisterBase)[0xC0/2];
+-		BOOL pip = (BOOL)b->CardData[ZZ_CARD_DATA_VIDEO_OVERLAY];
+-		const char *value = tooltype_value(tool_types, "VIDEOPIP");
+-		if (value)
+-			pip = !value_is_false(value);
+-		BOOL z3_ready = (b->CardFlags & CARDFLAG_ZORRO_3) && b->AllocBitMap;
+-		BOOL z2_ready = zz_z2_layout_active(b) && zz_gfxdata(b) &&
+-			b->CardData[ZZ_CARD_DATA_PIP_SIZE] != 0;
+-		if (pip && fwrev >= VIDEO_OVERLAY_MIN_FWREV &&
+-				(z3_ready || z2_ready)) {
+-			if (z2_ready) {
+-				b->AllocBitMap = (void *)ZZ_AllocBitMap;
+-				b->FreeBitMap = (void *)ZZ_FreeBitMap;
+-				b->GetBitMapAttr = (void *)ZZ_GetBitMapAttr;
+-			}
+-			b->Flags |= BIF_VIDEOWINDOW;
+-			b->GetFeatureAttrs = (void *)ZZ_GetFeatureAttrs;
+-			b->CreateFeature = (void *)ZZ_CreateFeature;
+-			b->SetFeatureAttrs = (void *)ZZ_SetFeatureAttrs;
+-			b->DeleteFeature = (void *)ZZ_DeleteFeature;
+-			zz_overlay_hooks_enabled = TRUE;
+-		}
+-	}
++	/* Not offered on MiSTer (no ZZ9000 video formatter / ARM SDK):
++	 * hardware sprite, video capture switch, screen split, secondary
++	 * palette, DPMS, off-screen bitmap allocator, YUV/PIP overlay. */
+ 
+-	apply_card_settings(b, tool_types);
+ 	blitter_cache_reset(&blitter_register_cache);
+ 	gfxdata_byte_cache_reset();
+ 
+@@ -1147,17 +1095,16 @@ int __attribute__((used)) InitCard(__REGA0(struct BoardInfo* b), __REGA1(char **
+ }
+ 
+ // None of these five really have to do anything.
+-void SetDAC (__REGA0(struct BoardInfo *b), __REGD7(RGBFTYPE format)) { }
+-void WaitBlitter (__REGA0(struct BoardInfo *b)) {
+-	if (!b || !b->RegisterBase)
++void SetDAC (__REGA0(struct BoardInfo *b), __REGD7(RGBFTYPE format)) {
++	/* MiSTer: the scanout pixel format lives in rtg.v's FORMAT register. */
++	if (!b || !mister_regs(b) || format >= ARRAY_SIZE(mister_format))
+ 		return;
+-
+-	MNTZZ9KRegs *regs = (MNTZZ9KRegs *)b->RegisterBase;
+-	// Firmware register writes dispatch the blitter synchronously; this gives
+-	// P96's wait hook a register-read fence without inventing a fake busy bit.
+-	volatile UWORD fence = regs->blitter_dma_op;
+-	fence = regs->blitter_acc_op;
+-	(void)fence;
++	mister_regs(b)[MISTER_REG_FORMAT / 2] = mister_format[format];
++}
++void WaitBlitter (__REGA0(struct BoardInfo *b)) {
++	/* MiSTer: mister_kick() only returns once the ARM has finished the op
++	 * and the FPGA CPU cache has been dropped, so there is never a blit in
++	 * flight here. */
+ }
+ void SetClock (__REGA0(struct BoardInfo *b)) { }
+ void SetMemoryMode (__REGA0(struct BoardInfo *b), __REGD7(RGBFTYPE format)) { }
+@@ -1203,51 +1150,19 @@ static inline void sanitize_mode_flags(struct ModeInfo *mode_info) {
+ }
+ 
+ void SetGC(__REGA0(struct BoardInfo *b), __REGA1(struct ModeInfo *mode_info), __REGD0(BOOL border)) {
+-	uint16_t colormode;
+-	struct zz_p96_mode p96;
+-	struct zz_modeline_plan plan;
+-
+ 	if (!b)
+ 		return;
+ 	b->CardData[ZZ_CARD_DATA_GC_REJECTED] = 1;
+-	if (!mode_info)
++	if (!mode_info || !mister_regs(b))
+ 		return;
+ 
+-	MNTZZ9KRegs* registers = (MNTZZ9KRegs *)b->RegisterBase;
+-
+-	if (mode_info->Width < 320 || mode_info->Height < 200)
+-		return;
+-
+-	colormode = mnt_colormode(b->RGBFormat);
+-	if (colormode == MNTVA_COLOR_NO_USE)
+-		return;
+-
+-	zz_p96_mode_of(mode_info, mode_info->PixelClock, &p96);
+-	if (!zz_p96_plan_modeline(&p96, zz_firmware_capabilities(b), &plan)) {
+-		/* Refused mode: keep the accepted ModeInfo pointer, Border and
+-		 * scanout untouched, and arm the SetPanning guard so a
+-		 * following panning call cannot apply this layout. */
+-		KPrintF("ZZ9000.card: refused mode %ldx%ld.\n",
+-			(LONG)mode_info->Width, (LONG)mode_info->Height);
+-		return;
+-	}
+-
+-	if (plan.action == ZZ_MODELINE_CUSTOM) {
+-		if (!zz_custom_stage_and_commit(&plan.custom, (uint8_t)colormode,
+-				zz_custom_reg_write, (void *)registers,
+-				zz_custom_reg_status)) {
+-			KPrintF("ZZ9000.card: firmware refused custom mode %ldx%ld.\n",
+-				(LONG)mode_info->Width, (LONG)mode_info->Height);
+-			return;
+-		}
+-	} else {
+-		/* Fixed preset (exact packaged timing on new firmware, plain
+-		 * dimension selection on older firmware). */
+-		sanitize_mode_flags(mode_info);
+-		zzwrite16(&registers->mode,
+-			plan.preset->mode_id | ((uint16_t)colormode << 8) |
+-			((uint16_t)plan.scale << 12));
+-	}
++	/* MiSTer: the scaler generates the output timing; the core only needs
++	 * the source geometry (as MiSTer.card). STRIDE is rewritten by
++	 * SetPanning from the real bitmap pitch. */
++	volatile UWORD *regs = mister_regs(b);
++	regs[MISTER_REG_STRIDE / 2] = mister_pitch(mode_info->Width, b->RGBFormat);
++	regs[MISTER_REG_HSIZE / 2] = mode_info->Width;
++	regs[MISTER_REG_VSIZE / 2] = mode_info->Height;
+ 
+ 	b->ModeInfo = mode_info;
+ 	b->Border = border;
+@@ -1257,41 +1172,20 @@ void SetGC(__REGA0(struct BoardInfo *b), __REGA1(struct ModeInfo *mode_info), __
+ UWORD SetSwitch(__REGA0(struct BoardInfo *b), __REGD0(UWORD enabled)) {
+ 	UWORD old = b ? (UWORD)b->CardData[ZZ_CARD_DATA_MONITOR_SWITCH] : 1;
+ 
+-	if (!b || !b->RegisterBase)
++	if (!b || !mister_regs(b))
+ 		return old;
+ 
++	/* MiSTer: rtg.v ENABLE switches the scaler between the RTG framebuffer
++	 * (1) and the native Amiga display (0). */
+ 	b->CardData[ZZ_CARD_DATA_MONITOR_SWITCH] = enabled ? 1 : 0;
+ 	b->MoniSwitch = (UWORD)b->CardData[ZZ_CARD_DATA_MONITOR_SWITCH];
+-	MNTZZ9KRegs* registers = (MNTZZ9KRegs *)b->RegisterBase;
+-
+-	if (enabled == 0) {
+-		// capture 24 bit amiga video to 0xe00000
+-
+-		{
+-			ULONG pan = zz_vcap_native_pan_offset(
+-				(UWORD)b->CardData[ZZ_CARD_DATA_VCAP_MODE],
+-				(UWORD)b->CardData[ZZ_CARD_DATA_FW_CAPABILITIES]);
+-
+-			zzwrite16(&registers->pan_ptr_hi, (UWORD)(pan >> 16));
+-			zzwrite16(&registers->pan_ptr_lo, (UWORD)(pan & 0xffff));
+-		}
+-
+-		// firmware will detect that we are capturing and viewing the capture area
+-		// and switch to the appropriate video mode (VCAP_MODE)
+-		*(volatile uint16_t*)((uint32_t)registers + 0x1006) = 1; // capture mode
+-	} else {
+-		// rtg mode
+-		*(volatile uint16_t*)((uint32_t)registers + 0x1006) = 0; // capture mode
+-
+-		if (b->ModeInfo)
+-			SetGC(b, b->ModeInfo, b->Border);
+-	}
++	mister_regs(b)[MISTER_REG_ENABLE / 2] = enabled ? 1 : 0;
+ 
+ 	return old;
+ }
+ 
+ void SetPanning(__REGA0(struct BoardInfo *b), __REGA1(UBYTE *addr), __REGD0(UWORD width), __REGD1(WORD x_offset), __REGD2(WORD y_offset), __REGD4(UWORD height), __REGD7(RGBFTYPE format)) {
+-	if (!b) return;
++	if (!b || !mister_regs(b)) return;
+ 
+ 	/* Width and format cannot identify which framebuffer belongs to a
+ 	 * refused mode. Resume panning only after a successful SetGC. */
+@@ -1300,69 +1194,31 @@ void SetPanning(__REGA0(struct BoardInfo *b), __REGA1(UBYTE *addr), __REGD0(UWOR
+ 
+ 	b->XOffset = x_offset;
+ 	b->YOffset = y_offset;
+-	MNTZZ9KRegs* registers = (MNTZZ9KRegs *)b->RegisterBase;
+ 
+-	if (b->CardFlags & CARDFLAG_ZORRO_3) {
+-		dmy_cache
+-		gfxdata->offset[0] = ((uint32_t)addr - (uint32_t)b->MemoryBase);
+-
+-		gfxdata->x[0] = x_offset;
+-		gfxdata->y[0] = y_offset;
+-		gfxdata->x[1] = width;
+-		writeGfxDataU8(gfxdata, GFXDATA_U8_COLORMODE,
+-			(uint8)panning_colormode(mnt_colormode(format & 0xFF)));
+-		zzwrite16(&registers->blitter_dma_op, OP_PAN);
+-	} else {
+-		uint32_t offset = ((uint32_t)addr - (uint32_t)b->MemoryBase);
++	/* MiSTer: rtg.v scans out from an ARM physical address with its own
++	 * stride, so panning is just the start of the visible area. */
++	volatile UWORD *regs = mister_regs(b);
++	ULONG bpp = mister_bytes_per_pixel(format);
++	ULONG pitch = mister_pitch(width, format);
++	ULONG offset = ((ULONG)addr - (ULONG)b->MemoryBase) +
++		(ULONG)y_offset * pitch + (ULONG)x_offset * bpp;
++	ULONG phys = MZZ_FB_PHYS + offset;
+ 
+-		writeBlitterX1(registers, x_offset);
+-		writeBlitterY1(registers, y_offset);
+-		writeBlitterX2(registers, width);
+-		writeBlitterColorMode(registers, panning_colormode(mnt_colormode(format & 0xFF)));
+-		zzwrite32(&registers->pan_ptr_hi, offset);
+-	}
++	regs[MISTER_REG_STRIDE / 2] = (UWORD)pitch;
++	*(volatile ULONG *)&regs[MISTER_REG_ADDRESS / 2] = phys;
+ }
+ 
+ void SetColorArray(__REGA0(struct BoardInfo *b), __REGD0(UWORD start), __REGD1(UWORD num)) {
+-	if (!b || !num)
++	if (!b || !num || !mister_regs(b) || start >= 256)
+ 		return;
+ 
+-	MNTZZ9KRegs* registers = (MNTZZ9KRegs *)b->RegisterBase;
+-	struct CLUTEntry *clut = (start >= 256) ? b->SecondaryCLUT : b->CLUT;
+-	UWORD count = (num > 256) ? 256 : num;
+-
+-	if (start >= 256) {
+-		if (!b->CardData[ZZ_CARD_DATA_SECONDARY_PALETTE]) {
+-			selectCardFeature(registers, CARD_FEATURE_SECONDARY_PALETTE);
+-			zzwrite16(&registers->set_feature_status, 1);
+-			b->CardData[ZZ_CARD_DATA_SECONDARY_PALETTE] = 1;
+-		}
+-	}
++	/* MiSTer: one CLUT in rtg.v, 256 x $00RRGGBB longwords. */
++	volatile ULONG *pal = (volatile ULONG *)((UBYTE *)mister_regs(b) + MISTER_REG_PALETTE);
++	UWORD end = (start + num > 256) ? 256 : start + num;
+ 
+-	if (b->CardFlags & CARDFLAG_ZORRO_3) {
+-		dmy_cache
+-		for (int i = 0; i < count; i++) {
+-			int ci = (start + i) & 0xFF;
+-			gfxdata->clut1[i * 3]     = clut[ci].Red;
+-			gfxdata->clut1[i * 3 + 1] = clut[ci].Green;
+-			gfxdata->clut1[i * 3 + 2] = clut[ci].Blue;
+-		}
+-		gfxdata->user[0] = start;
+-		gfxdata->user[1] = count;
+-		writeGfxDataU8(gfxdata, 0, (start >= 256) ? 1 : 0);
+-		zzwrite16(&registers->blitter_dma_op, OP_SET_PALETTE);
+-	} else {
+-		int op = (start >= 256) ? 19 : 3;
+-		for (int i = 0; i < count; i++) {
+-			int ci = (start + i) & 0xFF;
+-			unsigned long xrgb = ((uint32_t)ci << 24) | ((uint32_t)clut[ci].Red << 16) | ((uint32_t)clut[ci].Green << 8) | ((uint32_t)clut[ci].Blue);
+-
+-			*(volatile uint16_t*)((uint32_t)registers + 0x1000) = xrgb >> 16;
+-			*(volatile uint16_t*)((uint32_t)registers + 0x1002) = xrgb & 0xFFFF;
+-			*(volatile uint16_t*)((uint32_t)registers + 0x1004) = op;
+-			*(volatile uint16_t*)((uint32_t)registers + 0x1004) = 0;
+-		}
+-	}
++	for (UWORD i = start; i < end; i++)
++		pal[i] = ((ULONG)b->CLUT[i].Red << 16) | ((ULONG)b->CLUT[i].Green << 8) |
++			b->CLUT[i].Blue;
+ }
+ 
+ uint16_t calc_pitch_bytes(uint16_t w, uint16_t colormode) {
+@@ -1404,7 +1260,7 @@ UWORD CalculateBytesPerRow(__REGA0(struct BoardInfo *b), __REGA1(struct ModeInfo
+ 	if (!supported_rgb_format(format))
+ 		return 0;
+ 
+-	return calc_pitch_bytes(width, mnt_colormode(format));
++	return mister_pitch(width, format);
+ }
+ 
+ APTR CalculateMemory(__REGA0(struct BoardInfo *b), __REGA1(APTR addr), __REGD0(struct RenderInfo *r), __REGD7(RGBFTYPE format)) {
+@@ -1450,30 +1306,16 @@ void SetDPMSLevel(__REGA0(struct BoardInfo *b), __REGD0(ULONG level)) {
+ 	zzwrite16(&registers->set_feature_status, (UWORD)level);
+ }
+ 
+-LONG ResolvePixelClock(__REGA0(struct BoardInfo *b), __REGA1(struct ModeInfo *mode_info), __REGD0(ULONG pixel_clock), __REGD7(RGBFTYPE format)) {
+-	struct zz_p96_mode p96;
+-	struct zz_modeline_plan plan;
++/* MiSTer: the scaler produces the output timing, so every mode gets the
++ * same nominal pixel clock (as MiSTer.card). */
++#define MISTER_PIXEL_CLOCK 100000000UL
+ 
++LONG ResolvePixelClock(__REGA0(struct BoardInfo *b), __REGA1(struct ModeInfo *mode_info), __REGD0(ULONG pixel_clock), __REGD7(RGBFTYPE format)) {
+ 	if (!mode_info || !supported_rgb_format(format))
+ 		return -1;
+ 
+-	/* Honor the clock P96 selected from the GetPixelClock list; the
+-	 * negotiation reports the nearest clock the card can actually
+-	 * generate so P96 never computes refresh rates from a promise.
+-	 * Timing completeness is not required here: P96 settings tooling
+-	 * resolves clocks mid-edit; SetGC performs the full validation. */
+-	zz_p96_mode_of(mode_info, pixel_clock, &p96);
+-	if (!zz_p96_negotiate_pixel_clock(&p96, zz_firmware_capabilities(b), &plan))
+-		return -1;
+-
+-	if (plan.action == ZZ_MODELINE_PRESET) {
+-		/* Presets and the legacy fixed table have one clock each; the
+-		 * historical overwrite behavior is kept. */
+-		sanitize_mode_flags(mode_info);
+-		mode_info->PixelClock = plan.preset->pixel_clock_hz;
+-	} else {
+-		mode_info->PixelClock = plan.achieved_clock;
+-	}
++	sanitize_mode_flags(mode_info);
++	mode_info->PixelClock = MISTER_PIXEL_CLOCK;
+ 	mode_info->pll1.Clock = 0;
+ 	mode_info->pll2.ClockDivide = 1;
+ 
+@@ -1481,37 +1323,25 @@ LONG ResolvePixelClock(__REGA0(struct BoardInfo *b), __REGA1(struct ModeInfo *mo
+ }
+ 
+ ULONG GetPixelClock(__REGA0(struct BoardInfo *b), __REGA1(struct ModeInfo *mode_info), __REGD0(ULONG index), __REGD7(RGBFTYPE format)) {
+-	struct zz_p96_mode p96;
+-	struct zz_modeline_plan plan;
+-
+-	if (index != 0 || !mode_info || !supported_rgb_format(format))
++	if (index != 0 || !supported_rgb_format(format))
+ 		return 0;
+ 
+-	/* The single advertised clock is the one ResolvePixelClock and
+-	 * SetGC will actually program for this timing (PixelClockCount is
+-	 * one entry per format). Like ResolvePixelClock this answers for
+-	 * timings still being edited. */
+-	zz_p96_mode_of(mode_info, mode_info->PixelClock, &p96);
+-	if (!zz_p96_negotiate_pixel_clock(&p96, zz_firmware_capabilities(b), &plan))
+-		return 0;
+-
+-	if (plan.action == ZZ_MODELINE_PRESET)
+-		return plan.preset->pixel_clock_hz;
+-
+-	return plan.achieved_clock;
++	return MISTER_PIXEL_CLOCK;
+ }
+ 
++/* MiSTer: rtg.v has no vblank status; use the Amiga beam like MiSTer.card.
++ * VPOSR/VHPOSR as one longword: V8 in bit 16, V7..V0 in bits 15..8. */
+ #define VBLANK_WAIT_LIMIT 200000UL
++#define AMIGA_VPOS() ((*(volatile ULONG *)0xDFF004 >> 8) & 0x1FF)
+ 
+ static inline BOOL vblank_state(struct BoardInfo *b) {
+-	MNTZZ9KRegs *regs = (MNTZZ9KRegs *)b->RegisterBase;
+-	return regs->vblank_status != 0;
++	return AMIGA_VPOS() < 26;
+ }
+ 
+ void WaitVerticalSync(__REGA0(struct BoardInfo *b), __REGD0(BOOL end)) {
+ 	ULONG guard = VBLANK_WAIT_LIMIT;
+ 
+-	if (!b || !b->RegisterBase)
++	if (!b)
+ 		return;
+ 
+ 	if (end) {
+@@ -1522,7 +1352,7 @@ void WaitVerticalSync(__REGA0(struct BoardInfo *b), __REGD0(BOOL end)) {
+ }
+ 
+ BOOL GetVSyncState(__REGA0(struct BoardInfo *b), __REGD0(BOOL expected)) {
+-	if (!b || !b->RegisterBase)
++	if (!b)
+ 		return expected;
+ 
+ 	return vblank_state(b);
+@@ -1615,7 +1445,7 @@ static inline void fill_rect_accel(struct BoardInfo *b, struct RenderInfo *r,
+ 		gfxdata->y[0] = y;
+ 		gfxdata->y[1] = h;
+ 
+-		zzwrite16(&registers->blitter_dma_op, OP_FILLRECT);
++		mister_kick(b, OP_FILLRECT);
+ 	} else {
+ 		// Don't waste ~11 ZorroII write cycles to draw a very small rectangle.
+ 		// Use min dimension so that thin lines (w=1 or h=1) always use the
+@@ -1644,7 +1474,7 @@ void FillRect(__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), __REG
+ 	if (!b || !r) return;
+ 	if (w<1 || h<1) return;
+ 
+-	uint16_t colormode = mnt_colormode(format);
++	uint16_t colormode = blit_colormode(b, format);
+ 	if (colormode == MNTVA_COLOR_NO_USE) {
+ 		if (b->FillRectDefault)
+ 			b->FillRectDefault(b, r, x, y, w, h, color, mask, format);
+@@ -1659,7 +1489,7 @@ void InvertRect(__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), __R
+ 	if (!b || !r)
+ 		return;
+ 
+-	uint16_t colormode = mnt_colormode(format);
++	uint16_t colormode = blit_colormode(b, format);
+ 	if (colormode == MNTVA_COLOR_NO_USE) {
+ 		if (b->InvertRectDefault)
+ 			b->InvertRectDefault(b, r, x, y, w, h, mask, format);
+@@ -1681,7 +1511,7 @@ void InvertRect(__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), __R
+ 		gfxdata->y[0] = y;
+ 		gfxdata->y[1] = h;
+ 
+-		zzwrite16(&registers->blitter_dma_op, OP_INVERTRECT);
++		mister_kick(b, OP_INVERTRECT);
+ 	} else {
+ 		// Don't waste ~9 ZorroII write cycles to invert a very small rectangle.
+ 		WORD min_dim = (w < h) ? w : h;
+@@ -1710,7 +1540,7 @@ void BlitRect(__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), __REG
+ 	if (w<1 || h<1) return;
+ 	if (!b || !r) return;
+ 
+-	uint16_t colormode = mnt_colormode(format);
++	uint16_t colormode = blit_colormode(b, format);
+ 	if (colormode == MNTVA_COLOR_NO_USE) {
+ 		if (b->BlitRectDefault)
+ 			b->BlitRectDefault(b, r, x, y, dx, dy, w, h, mask, format);
+@@ -1745,7 +1575,7 @@ void BlitRect(__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), __REG
+ 		writeGfxDataMask(gfxdata, mask);
+ 
+ 		// Source and destination rectangle may be overlapping, a proper copy operation shall be performed in either case.
+-		zzwrite16(&registers->blitter_dma_op, OP_COPYRECT);
++		mister_kick(b, OP_COPYRECT);
+ 	} else {
+ 		writeBlitterY1(registers, dy);
+ 		writeBlitterY2(registers, h);
+@@ -1771,7 +1601,7 @@ void BlitRectNoMaskComplete(__REGA0(struct BoardInfo *b), __REGA1(struct RenderI
+ 	if (w<1 || h<1) return;
+ 	if (!b || !rs || !rt) return;
+ 
+-	uint16_t colormode = mnt_colormode(format);
++	uint16_t colormode = blit_colormode(b, format);
+ 	if (colormode == MNTVA_COLOR_NO_USE) {
+ 		if (b->BlitRectNoMaskCompleteDefault)
+ 			b->BlitRectNoMaskCompleteDefault(b, rs, rt, x, y, dx, dy, w, h, minterm, format);
+@@ -1807,7 +1637,7 @@ void BlitRectNoMaskComplete(__REGA0(struct BoardInfo *b), __REGA1(struct RenderI
+ 		// The common RGBFormat of source and destination is in register d7, it shall not be taken from the source or destination RenderInfo.
+ 		writeGfxDataU8(gfxdata, GFXDATA_U8_COLORMODE, (uint8_t)colormode);
+ 
+-		zzwrite16(&registers->blitter_dma_op, OP_COPYRECT_NOMASK);
++		mister_kick(b, OP_COPYRECT_NOMASK);
+ 	} else {
+ 		writeBlitterY1(registers, dy);
+ 		writeBlitterY2(registers, h);
+@@ -1836,7 +1666,7 @@ void BlitTemplate(__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), _
+ 	if (w<1 || h<1) return;
+ 	if (!t) return;
+ 
+-	uint16_t colormode = mnt_colormode(format);
++	uint16_t colormode = blit_colormode(b, format);
+ 	if (colormode == MNTVA_COLOR_NO_USE) {
+ 		if (b->BlitTemplateDefault)
+ 			b->BlitTemplateDefault(b, r, t, x, y, w, h, mask, format);
+@@ -1851,6 +1681,15 @@ void BlitTemplate(__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), _
+ 	}
+ 
+ 	uint32_t zz_template_addr = Z3_TEMPLATE_ADDR;
++	/* MiSTer: the staging area is MZZ_TEMPLATE_SIZE, not the ZZ9000's
++	 * open-ended Z3 scratch space. */
++	if ((b->CardFlags & CARDFLAG_ZORRO_3) &&
++	    (!t->BytesPerRow ||
++	     (uint32_t)t->BytesPerRow * (uint32_t)h > MZZ_TEMPLATE_SIZE)) {
++		if (b->BlitTemplateDefault)
++			b->BlitTemplateDefault(b, r, t, x, y, w, h, mask, format);
++		return;
++	}
+ 	if (!(b->CardFlags & CARDFLAG_ZORRO_3)) {
+ 		uint32_t staged_size;
+ 
+@@ -1891,7 +1730,7 @@ void BlitTemplate(__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), _
+ 		writeGfxDataU8(gfxdata, GFXDATA_U8_DRAWMODE, t->DrawMode);
+ 		writeGfxDataMask(gfxdata, mask);
+ 
+-		zzwrite16(&registers->blitter_dma_op, OP_RECT_TEMPLATE);
++		mister_kick(b, OP_RECT_TEMPLATE);
+ 	} else {
+ 		writeBlitterSrcOffset(registers, zz_template_addr);
+ 
+@@ -1916,7 +1755,7 @@ void BlitPattern(__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), __
+ 	if (w<1 || h<1) return;
+ 	if (!pat) return;
+ 
+-	uint16_t colormode = mnt_colormode(format);
++	uint16_t colormode = blit_colormode(b, format);
+ 	if (colormode == MNTVA_COLOR_NO_USE) {
+ 		if (b->BlitPatternDefault)
+ 			b->BlitPatternDefault(b, r, pat, x, y, w, h, mask, format);
+@@ -1959,7 +1798,7 @@ void BlitPattern(__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), __
+ 		gfxdata->user[0] = (1 << pat->Size);
+ 		writeGfxDataMask(gfxdata, mask);
+ 
+-		zzwrite16(&registers->blitter_dma_op, OP_RECT_PATTERN);
++		mister_kick(b, OP_RECT_PATTERN);
+ 	} else {
+ 		writeBlitterSrcOffset(registers, zz_template_addr);
+ 
+@@ -1994,7 +1833,7 @@ void DrawLine(__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), __REG
+ 		return;
+ 	}
+ 
+-	uint16_t colormode = mnt_colormode(format);
++	uint16_t colormode = blit_colormode(b, format);
+ 	if (colormode == MNTVA_COLOR_NO_USE) {
+ 		if (b->DrawLineDefault)
+ 			b->DrawLineDefault(b, r, l, mask, format);
+@@ -2118,7 +1957,7 @@ void DrawLine(__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), __REG
+ 
+ 		writeGfxDataMask(gfxdata, mask);
+ 
+-		zzwrite16(&registers->blitter_dma_op, OP_DRAWLINE);
++		mister_kick(b, OP_DRAWLINE);
+ 	} else {
+ 		uint32_t offset = ((uint32_t)r->Memory - (uint32_t)b->MemoryBase);
+ 		/* Solid lines (LinePtrn 0xFFFF, full mask, JAM1) dispatch to the
+@@ -2880,6 +2719,12 @@ void BlitPlanar2Chunky(__REGA0(struct BoardInfo *b), __REGA1(struct BitMap *bm),
+ 		b->BlitPlanar2ChunkyDefault(b, bm, r, x, y, dx, dy, w, h, minterm, mask);
+ 		return;
+ 	}
++	/* MiSTer: ARM blitter attached, at most 8 planes, staging area fits. */
++	if (!mister_accel(b) || bm->Depth > 8 ||
++	    (uint32_t)output_plane_size * bm->Depth > MZZ_TEMPLATE_SIZE) {
++		b->BlitPlanar2ChunkyDefault(b, bm, r, x, y, dx, dy, w, h, minterm, mask);
++		return;
++	}
+ 
+ 	if (!(b->CardFlags & CARDFLAG_ZORRO_3)) {
+ 		zz_template_addr = zz_z2_template_offset(b);
+@@ -2932,7 +2777,7 @@ void BlitPlanar2Chunky(__REGA0(struct BoardInfo *b), __REGA1(struct BitMap *bm),
+ 		gfxdata->user[0] = zz_mask;
+ 		gfxdata->user[1] = bm->Depth;
+ 
+-		zzwrite16(&registers->blitter_dma_op, OP_P2C);
++		mister_kick(b, OP_P2C);
+ 	} else {
+ 		writeBlitterX1(registers, x & 0x07);
+ 		writeBlitterX2(registers, dx);
+@@ -2969,6 +2814,16 @@ void BlitPlanar2Direct(__REGA0(struct BoardInfo *b), __REGA1(struct BitMap *bm),
+ 		b->BlitPlanar2DirectDefault(b, bm, r, clut, x, y, dx, dy, w, h, minterm, mask);
+ 		return;
+ 	}
++	/* MiSTer: ARM blitter attached, a 16/32-bit target (no ZZ9000 24-bit
++	 * mode), at most 8 planes, colour table + planes fit the staging area. */
++	{
++		uint16_t cm = blit_colormode(b, r->RGBFormat);
++		if (cm == MNTVA_COLOR_NO_USE || cm == MNTVA_COLOR_8BIT || bm->Depth > 8 ||
++		    (256 << 2) + (uint32_t)output_plane_size * bm->Depth > MZZ_TEMPLATE_SIZE) {
++			b->BlitPlanar2DirectDefault(b, bm, r, clut, x, y, dx, dy, w, h, minterm, mask);
++			return;
++		}
++	}
+ 
+ 	if (!(b->CardFlags & CARDFLAG_ZORRO_3)) {
+ 		zz_template_addr = zz_z2_template_offset(b);
+@@ -3035,7 +2890,7 @@ void BlitPlanar2Direct(__REGA0(struct BoardInfo *b), __REGA1(struct BitMap *bm),
+ //		unsigned long cf=r->RGBFormat;
+ //		KPrintF("minterm = %ld, mask=%ld, zzmask=0x%08lX, colormask=0x%08lX, colorformat=%ld\n", mi, ma, zm, cm, cf);
+ 
+-		zzwrite16(&registers->blitter_dma_op, OP_P2D);
++		mister_kick(b, OP_P2D);
+ 	} else {
+ 		writeBlitterX1(registers, x & 0x07);
+ 		writeBlitterX2(registers, dx);
+diff --git a/zz9000/amiga/tools/MiSTerZZInfo.c b/zz9000/amiga/tools/MiSTerZZInfo.c
+new file mode 100644
+index 00000000..693c347e
+--- /dev/null
++++ b/zz9000/amiga/tools/MiSTerZZInfo.c
+@@ -0,0 +1,89 @@
++/*
++ * MiSTerZZInfo - show the state of the MiSTer ZZ9000 RTG blitter.
++ *
++ * Read-only: finds the Minimig Z3 RTG board, dumps the rtg.v scanout
++ * registers and the driver<->ARM mailbox (common/mister_zz9000.h), and
++ * watches the ARM heartbeat for half a second. Writes nothing, so it is
++ * safe to run while MiSTerZZ.card is driving the screen.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#include <proto/exec.h>
++#include <proto/expansion.h>
++#include <proto/dos.h>
++#include <libraries/configvars.h>
++#include <stdio.h>
++
++/* NDK 3.2 ULONG is unsigned int (32-bit): printf with %u/%X. */
++
++#include "../../common/mister_zz9000.h"
++
++struct ExpansionBase *ExpansionBase;
++
++static ULONG mb(UBYTE *board, ULONG field)
++{
++	CacheClearU();   /* the FPGA CPU cache holds RTG window lines */
++	return *(volatile ULONG *)(board + MZZ_MBOX_OFFSET + field);
++}
++
++static void fourcc(ULONG v, char *out)
++{
++	for (int i = 0; i < 4; i++) {
++		char c = (char)(v >> (24 - 8 * i));
++		out[i] = (c >= 32 && c < 127) ? c : '.';
++	}
++	out[4] = 0;
++}
++
++int main(void)
++{
++	struct ConfigDev *cd;
++	char f1[5], f2[5];
++
++	if (!(ExpansionBase = (struct ExpansionBase *)OpenLibrary((STRPTR)"expansion.library", 0)))
++		return 20;
++	cd = FindConfigDev(NULL, MZZ_RTG_MANUFACTURER, MZZ_RTG_PRODUCT);
++	CloseLibrary((struct Library *)ExpansionBase);
++	if (!cd) {
++		printf("Minimig Z3 RTG board (%04X/%02X) not found - core without RTG?\n",
++			MZZ_RTG_MANUFACTURER, MZZ_RTG_PRODUCT);
++		return 10;
++	}
++
++	UBYTE *board = (UBYTE *)cd->cd_BoardAddr;
++	volatile UWORD *regs = (volatile UWORD *)(board + MZZ_REGS_OFFSET + MZZ_REG_SUB_OFFSET);
++
++	printf("RTG board        $%08X, %d KB, %s\n", (ULONG)board,
++		(ULONG)cd->cd_BoardSize >> 10,
++		(cd->cd_Flags & CDF_CONFIGME) ? "unclaimed" : "claimed by a driver");
++	printf("rtg.v ID         $%04X (expect $5001)\n", regs[7]);
++	printf("scanout          enable %u format $%02X %ux%u stride %u addr $%08X\n",
++		regs[3], regs[2], regs[4], regs[5], regs[6],
++		((ULONG)regs[0] << 16) | regs[1]);
++
++	ULONG req = mb(board, MZZ_MB_REQ_MAGIC), ack = mb(board, MZZ_MB_ACK_MAGIC);
++	fourcc(req, f1);
++	fourcc(ack, f2);
++	printf("driver request   %s session $%08X kick %u op %u\n", f1,
++		mb(board, MZZ_MB_SESSION), mb(board, MZZ_MB_KICK), mb(board, MZZ_MB_OP));
++	printf("ARM answer       %s session $%08X taken %u done %u\n", f2,
++		mb(board, MZZ_MB_ACK_SESSION), mb(board, MZZ_MB_TAKEN), mb(board, MZZ_MB_DONE));
++	printf("ARM protocol     v%u caps $%08X, %u ops, %u rejected\n",
++		mb(board, MZZ_MB_VERSION), mb(board, MZZ_MB_CAPS),
++		mb(board, MZZ_MB_OPS), mb(board, MZZ_MB_REJECTED));
++
++	ULONG hb0 = mb(board, MZZ_MB_HEARTBEAT);
++	Delay(25);
++	ULONG hb1 = mb(board, MZZ_MB_HEARTBEAT);
++	printf("ARM heartbeat    %u -> %u in 0.5s\n", hb0, hb1);
++
++	if (req != MZZ_REQ_MAGIC)
++		printf("=> MiSTerZZ.card has not initialised the mailbox (not loaded?)\n");
++	else if (ack != MZZ_ACK_MAGIC || mb(board, MZZ_MB_ACK_SESSION) != mb(board, MZZ_MB_SESSION))
++		printf("=> no MiSTer blitter attached: MiSTer binary without ZZ9000 support?\n");
++	else if (hb0 == hb1)
++		printf("=> ARM attached but heartbeat stopped: MiSTer binary stopped/restarted?\n");
++	else
++		printf("=> ARM blitter attached and running\n");
++	return 0;
++}
+diff --git a/zz9000/common/mister_zz9000.h b/zz9000/common/mister_zz9000.h
+new file mode 100644
+index 00000000..5541b0dc
+--- /dev/null
++++ b/zz9000/common/mister_zz9000.h
+@@ -0,0 +1,98 @@
++/*
++ * MiSTer Minimig ZZ9000-compatible RTG accelerator - shared protocol.
++ *
++ * Included by the Amiga driver (amiga/rtg/mntgfx-gcc.c, m68k, big-endian)
++ * and by the MiSTer main binary (mister/minimig_zz9000.cpp, ARM,
++ * little-endian). Everything here is a byte offset or a constant; there is
++ * deliberately no shared struct, so the two compilers cannot disagree on
++ * layout. Multi-byte mailbox fields are big-endian (written/read natively
++ * by the 68k, byte-swapped by the ARM).
++ *
++ * Memory: the Minimig Z3 RTG board (mfr 0x139C, product 0x30) maps its
++ * 8MB framebuffer at board offset 0. It is DDR3 at ARM physical
++ * MZZ_FB_PHYS, byte-for-byte in Amiga order (rtl/cpu_wrapper.v swaps the
++ * bytes of every RTG CPU access). The top 256KB of that window is taken
++ * away from Picasso96 and shared between the driver and the ARM:
++ *
++ *   0x000000-0x7BFFFF  P96 video memory (b->MemorySize)
++ *   0x7C0000-0x7C00FF  mailbox (below)
++ *   0x7C1000-0x7C1C5F  struct GFXData, official ZZ9000 layout (zz9000.h)
++ *   0x7C2000-0x7FBFFF  template/pattern/planar staging (ZZ "template" area)
++ *   0x7FC000-0x7FFFFF  P96 mouse save buffer (same place as MiSTer.card)
++ *
++ * Handshake: the driver zeroes the mailbox, writes SESSION and then
++ * REQ_MAGIC. The ARM thread, once it sees REQ_MAGIC with a SESSION it has
++ * not attached to, writes VERSION/CAPS/DONE and then ACK_SESSION and
++ * ACK_MAGIC. The ARM never writes anywhere in the RTG window before it has
++ * seen REQ_MAGIC.
++ *
++ * Commands are synchronous, like the ZZ9000's register-triggered DMA ops:
++ * the driver fills GFXData (and the staging area), writes OP, then
++ * increments KICK. The ARM writes TAKEN=KICK when it starts, runs the op
++ * with the official ZZ9000OS blitter, then writes DONE=KICK. The driver
++ * spins until DONE==KICK, calling CacheClearU() before every read because
++ * the FPGA CPU cache (cpu_cache_new) does cache the RTG window and would
++ * otherwise hand back stale mailbox words - and stale pixels after an ARM
++ * blit.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#ifndef MISTER_ZZ9000_H
++#define MISTER_ZZ9000_H
++
++/* Board / window geometry */
++#define MZZ_RTG_MANUFACTURER   0x139C
++#define MZZ_RTG_PRODUCT        0x30
++#define MZZ_FB_SIZE            0x00800000UL   /* framebuffer window at board offset 0 */
++#define MZZ_REGS_OFFSET        0x00800000UL   /* rtg.v regs+CLUT 64KB block */
++#define MZZ_REG_SUB_OFFSET     0x00000100UL   /* control regs within that block */
++#define MZZ_FB_PHYS            0x27000000UL   /* ARM physical address of board offset 0 */
++
++/* Reserved top of the framebuffer window */
++#define MZZ_P96_MEMORY_SIZE    0x007C0000UL
++#define MZZ_MBOX_OFFSET        0x007C0000UL
++#define MZZ_GFXDATA_OFFSET     0x007C1000UL
++#define MZZ_TEMPLATE_OFFSET    0x007C2000UL
++#define MZZ_TEMPLATE_SIZE      0x0003A000UL
++#define MZZ_MOUSESAVE_OFFSET   0x007FC000UL
++
++/* Mailbox fields: byte offsets from MZZ_MBOX_OFFSET, 32-bit big-endian */
++#define MZZ_MB_REQ_MAGIC       0x00   /* Amiga: MZZ_REQ_MAGIC once initialised */
++#define MZZ_MB_SESSION         0x04   /* Amiga: changes on every driver init */
++#define MZZ_MB_KICK            0x08   /* Amiga: sequence number of the submitted op */
++#define MZZ_MB_OP              0x0C   /* Amiga: enum gfx_dma_op of that op */
++#define MZZ_MB_ACK_MAGIC       0x20   /* ARM: MZZ_ACK_MAGIC once attached */
++#define MZZ_MB_ACK_SESSION     0x24   /* ARM: SESSION it attached to */
++#define MZZ_MB_TAKEN           0x28   /* ARM: KICK it is working on */
++#define MZZ_MB_DONE            0x2C   /* ARM: last KICK completed */
++#define MZZ_MB_VERSION         0x30   /* ARM: MZZ_PROTOCOL_VERSION */
++#define MZZ_MB_CAPS            0x34   /* ARM: MZZ_CAP_* */
++#define MZZ_MB_HEARTBEAT       0x38   /* ARM: increments while the thread runs */
++#define MZZ_MB_OPS             0x3C   /* ARM: ops executed (statistics) */
++#define MZZ_MB_REJECTED        0x40   /* ARM: ops refused (unknown / out of range) */
++#define MZZ_MB_SIZE            0x100
++
++#define MZZ_REQ_MAGIC          0x4D5A5A39UL   /* 'MZZ9' */
++#define MZZ_ACK_MAGIC          0x6D7A7A39UL   /* 'mzz9' */
++#define MZZ_PROTOCOL_VERSION   1
++
++/* Ops the ARM executes (enum gfx_dma_op values from the ZZ9000 sources) */
++#define MZZ_CAP_FILLRECT       (1UL << 2)
++#define MZZ_CAP_COPYRECT       (1UL << 3)
++#define MZZ_CAP_COPYRECT_NOMASK (1UL << 4)
++#define MZZ_CAP_TEMPLATE       (1UL << 5)
++#define MZZ_CAP_PATTERN        (1UL << 6)
++#define MZZ_CAP_P2C            (1UL << 7)
++#define MZZ_CAP_P2D            (1UL << 8)
++#define MZZ_CAP_INVERTRECT     (1UL << 9)
++#define MZZ_CAP_DRAWLINE       (1UL << 1)
++#define MZZ_CAPS_V1            (MZZ_CAP_DRAWLINE | MZZ_CAP_FILLRECT | \
++                                MZZ_CAP_COPYRECT | MZZ_CAP_COPYRECT_NOMASK | \
++                                MZZ_CAP_TEMPLATE | MZZ_CAP_PATTERN | \
++                                MZZ_CAP_P2C | MZZ_CAP_P2D | MZZ_CAP_INVERTRECT)
++
++/* GFXData bytes the ARM snapshots per op: everything before the CLUTs
++ * (offset[2] .. u32_user[8] = 0x5C bytes, rounded up). */
++#define MZZ_GFXDATA_HEADER     0x60
++
++#endif
+diff --git a/zz9000/mister/install.py b/zz9000/mister/install.py
+new file mode 100755
+index 00000000..7e64f826
+--- /dev/null
++++ b/zz9000/mister/install.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""Install the ZZ9000 RTG blitter into a Main_MiSTer source tree.
++
++    zz9000/mister/install.py /path/to/Main_MiSTer
++
++Copies the sources into support/minimig/ and applies three small, idempotent
++edits:
++  Makefile     C_SRC also globs support/minimig/zz9000/*.c (the official
++               ZZ9000OS gfx.c is C and does not build as C++)
++  user_io.cpp  zz9000_stop() next to a2065_stop() when a core is (re)loaded,
++               zz9000_start() next to a2065_start() when Minimig is identified
++Re-running it refreshes the copied files and leaves already-applied edits
++alone.
++"""
++import os
++import shutil
++import sys
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++COMMON = os.path.join(HERE, '..', 'common')
++
++
++def copy(src, dst):
++    os.makedirs(os.path.dirname(dst), exist_ok=True)
++    shutil.copyfile(src, dst)
++    print('  copy', os.path.relpath(dst, TREE))
++
++
++def edit(path, anchor, insert, marker, after=True):
++    with open(path) as f:
++        s = f.read()
++    if marker in s:
++        print('  ok  ', os.path.relpath(path, TREE), '(%s)' % marker.strip())
++        return
++    if s.count(anchor) != 1:
++        sys.exit('error: %s: anchor %r found %d times' % (path, anchor, s.count(anchor)))
++    s = s.replace(anchor, anchor + insert if after else insert + anchor)
++    with open(path, 'w') as f:
++        f.write(s)
++    print('  edit', os.path.relpath(path, TREE), '(%s)' % marker.strip())
++
++
++if len(sys.argv) != 2:
++    sys.exit(__doc__)
++TREE = os.path.abspath(sys.argv[1])
++MM = os.path.join(TREE, 'support', 'minimig')
++if not os.path.isfile(os.path.join(TREE, 'user_io.cpp')) or not os.path.isdir(MM):
++    sys.exit('error: %s does not look like a Main_MiSTer tree' % TREE)
++
++print('Installing ZZ9000 RTG blitter into', TREE)
++copy(os.path.join(HERE, 'minimig_zz9000.cpp'), os.path.join(MM, 'minimig_zz9000.cpp'))
++copy(os.path.join(HERE, 'minimig_zz9000.h'), os.path.join(MM, 'minimig_zz9000.h'))
++ZZ = os.path.join(MM, 'zz9000')
++for name in ('zz9000_blit.c', 'zz9000_fbmem.c', 'zz9000_fbmem.h',
++             'zz9000_service.c', 'zz9000_service.h'):
++    copy(os.path.join(HERE, name), os.path.join(ZZ, name))
++copy(os.path.join(COMMON, 'mister_zz9000.h'), os.path.join(ZZ, 'mister_zz9000.h'))
++for name in sorted(os.listdir(os.path.join(HERE, 'zz9000os'))):
++    copy(os.path.join(HERE, 'zz9000os', name), os.path.join(ZZ, 'zz9000os', name))
++
++edit(os.path.join(TREE, 'Makefile'),
++     'C_SRC =   $(wildcard *.c) \\\n',
++     '          $(wildcard ./support/minimig/zz9000/*.c) \\\n',
++     'support/minimig/zz9000/*.c')
++
++UIO = os.path.join(TREE, 'user_io.cpp')
++edit(UIO, '#include "support/minimig/minimig_a2065.h"\n' if
++     '#include "support/minimig/minimig_a2065.h"\n' in open(UIO).read()
++     else '#include "support.h"\n',
++     '#include "support/minimig/minimig_zz9000.h"\n',
++     'minimig_zz9000.h')
++edit(UIO, '\ta2065_stop();\n',
++     '\n\t// ...and the ZZ9000 RTG blitter thread.\n\tzz9000_stop();\n',
++     'zz9000_stop();')
++edit(UIO, '\t\t\t\t\ta2065_start();\n',
++     '\t\t\t\t\tzz9000_start();\n',
++     'zz9000_start();')
++print('done')
+diff --git a/zz9000/mister/minimig_zz9000.cpp b/zz9000/mister/minimig_zz9000.cpp
+new file mode 100644
+index 00000000..f05a42ad
+--- /dev/null
++++ b/zz9000/mister/minimig_zz9000.cpp
+@@ -0,0 +1,134 @@
++// ZZ9000-compatible blitter for the Minimig Z3 RTG board - MiSTer glue.
++//
++// Maps the RTG framebuffer window and runs zz9000_service.c from a thread.
++// Polling policy: spin while the Amiga is drawing (ZZ ops are synchronous,
++// so every microsecond of poll latency is a microsecond the 68k stalls),
++// back off to 200us sleeps after a short idle period, and to 20ms while no
++// driver has attached at all.
++
++#include <pthread.h>
++#include <sched.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "../../shmem.h"
++#include "minimig_zz9000.h"
++#include "zz9000/mister_zz9000.h"
++#include "zz9000/zz9000_service.h"
++
++#define ZZ_SPIN_US        5000     // keep spinning this long after the last op
++#define ZZ_IDLE_SLEEP_US  200      // attached but idle
++#define ZZ_NODRV_SLEEP_US 20000    // no driver: the Amiga handshake waits ~1s
++#define ZZ_HEARTBEAT_US   100000
++
++static pthread_t zz_thread;
++static volatile int zz_running = 0;
++static uint8_t *zz_fb = NULL;
++
++static uint64_t now_us(void)
++{
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (uint64_t)ts.tv_sec * 1000000u + ts.tv_nsec / 1000u;
++}
++
++static void *zz_thread_main(void *)
++{
++	struct zz_service s;
++	void *gfx = calloc(1, zz_service_gfxdata_size());
++	if (!gfx) return NULL;
++
++	zz_service_init(&s, zz_fb, MZZ_FB_SIZE, gfx);
++
++	uint64_t last_op = 0, last_hb = 0;
++	int was_attached = 0, warned_swap = 0;
++
++	while (zz_running)
++	{
++		int r = zz_service_poll(&s);
++		uint64_t t = now_us();
++
++		if (r == ZZ_POLL_ATTACHED)
++		{
++			printf("ZZ9000: driver attached (session %08X)\n", s.session);
++			was_attached = 1;
++			last_op = t;
++			continue;
++		}
++		if (r == ZZ_POLL_OP)
++		{
++			last_op = t;
++			continue;
++		}
++
++		if (r == ZZ_POLL_NO_DRIVER)
++		{
++			if (was_attached)
++			{
++				printf("ZZ9000: driver detached after %u ops (%u rejected)\n", s.ops, s.rejected);
++				was_attached = 0;
++			}
++			if (s.swapped && !warned_swap)
++			{
++				printf("ZZ9000: mailbox magic is byte-swapped - core without the RTG byte swap? not attaching\n");
++				warned_swap = 1;
++			}
++			usleep(ZZ_NODRV_SLEEP_US);
++			continue;
++		}
++
++		if (t - last_hb >= ZZ_HEARTBEAT_US)
++		{
++			zz_service_heartbeat(&s);
++			last_hb = t;
++		}
++
++		if (t - last_op < ZZ_SPIN_US) sched_yield();
++		else usleep(ZZ_IDLE_SLEEP_US);
++	}
++
++	free(gfx);
++	return NULL;
++}
++
++void zz9000_stop(void)
++{
++	if (zz_running)
++	{
++		zz_running = 0;
++		pthread_join(zz_thread, NULL);
++	}
++	if (zz_fb)
++	{
++		shmem_unmap(zz_fb, MZZ_FB_SIZE);
++		zz_fb = NULL;
++	}
++}
++
++void zz9000_start(void)
++{
++	zz9000_stop();
++
++	zz_fb = (uint8_t *)shmem_map(MZZ_FB_PHYS, MZZ_FB_SIZE);
++	if (!zz_fb)
++	{
++		printf("ZZ9000: cannot map RTG framebuffer at 0x%08X\n", (unsigned)MZZ_FB_PHYS);
++		return;
++	}
++
++	// DDR3 survives a core reload: drop any stale request so a left-over
++	// mailbox from the previous session is never mistaken for a live driver.
++	*(volatile uint32_t *)(zz_fb + MZZ_MBOX_OFFSET + MZZ_MB_REQ_MAGIC) = 0;
++
++	zz_running = 1;
++	if (pthread_create(&zz_thread, NULL, zz_thread_main, NULL))
++	{
++		zz_running = 0;
++		printf("ZZ9000: cannot start service thread\n");
++		return;
++	}
++	printf("ZZ9000: RTG blitter service started\n");
++}
+diff --git a/zz9000/mister/minimig_zz9000.h b/zz9000/mister/minimig_zz9000.h
+new file mode 100644
+index 00000000..6ae4fc5e
+--- /dev/null
++++ b/zz9000/mister/minimig_zz9000.h
+@@ -0,0 +1,18 @@
++#ifndef __MINIMIG_ZZ9000_H__
++#define __MINIMIG_ZZ9000_H__
++
++// ZZ9000-compatible blitter for the Minimig Z3 RTG board.
++//
++// The Amiga side is ZZ9000.card (zz9000/amiga) built for MiSTer; it queues
++// ZZ9000 "DMA ops" in a mailbox at the top of the RTG framebuffer. This
++// module runs the official ZZ9000OS blitter on the ARM against that same
++// framebuffer (DDR3 at 0x27000000), from a thread so blits do not wait for
++// the main loop. Protocol: zz9000/common/mister_zz9000.h.
++
++// Start the service thread. Called when the Minimig core is identified.
++void zz9000_start(void);
++
++// Stop the thread and unmap. Called before another core is loaded.
++void zz9000_stop(void);
++
++#endif
+diff --git a/zz9000/mister/zz9000_blit.c b/zz9000/mister/zz9000_blit.c
+new file mode 100644
+index 00000000..77f7ff0d
+--- /dev/null
++++ b/zz9000/mister/zz9000_blit.c
+@@ -0,0 +1,43 @@
++/*
++ * Build wrapper for the official ZZ9000OS blitter (zz9000os/gfx.c) and its
++ * command dispatcher (zz9000os/dma_rtg.c) inside the MiSTer main binary.
++ *
++ * gfx.c is compiled unmodified; this translation unit only changes the
++ * environment it is compiled in, because its destination memory is the
++ * Strongly-ordered /dev/mem mapping of the RTG framebuffer:
++ *  - memset/memcpy/memmove go to the aligned-access-only zz_fb_* versions;
++ *  - NEON is switched off (the scalar paths only use naturally aligned
++ *    accesses, and the kernel cannot emulate a faulting NEON access);
++ *  - GCC may neither turn loops back into libc calls, merge stores into
++ *    wider, possibly unaligned ones, nor auto-vectorise them into NEON.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#pragma GCC optimize("no-tree-loop-distribute-patterns")
++#pragma GCC optimize("no-store-merging")
++#pragma GCC optimize("no-tree-vectorize")    /* no auto-NEON on Strongly-ordered memory */
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++#include "zz9000_fbmem.h"
++
++#undef __ARM_NEON__
++#undef __ARM_NEON
++
++#define memset  zz_fb_memset
++#define memcpy  zz_fb_memcpy
++#define memmove zz_fb_memmove
++
++/* Upstream code, upstream style: keep Main_MiSTer's -Wextra quiet about
++ * the intentional DECODE_PLANAR_PIXEL fall-throughs and unused arguments. */
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
++#pragma GCC diagnostic ignored "-Wunused-parameter"
++#pragma GCC diagnostic ignored "-Wtype-limits"
++#include "zz9000os/gfx.c"
++#pragma GCC diagnostic pop
++
++#include "zz9000os/dma_rtg.c"
+diff --git a/zz9000/mister/zz9000_fbmem.c b/zz9000/mister/zz9000_fbmem.c
+new file mode 100644
+index 00000000..46cb7dcb
+--- /dev/null
++++ b/zz9000/mister/zz9000_fbmem.c
+@@ -0,0 +1,149 @@
++/*
++ * Framebuffer-safe memset/memcpy/memmove - see zz9000_fbmem.h.
++ *
++ * Misaligned copies use the classic shift-merge: aligned word loads from
++ * the source, two of them combined per aligned destination word. A load
++ * may read up to 3 bytes outside the requested range, but never outside
++ * the aligned word that holds a requested byte, so it cannot cross a page
++ * or the end of the mapping. Little-endian only (ARM and the test host).
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#pragma GCC optimize("no-tree-loop-distribute-patterns") /* no memcpy() calls back into libc */
++#pragma GCC optimize("no-store-merging")                 /* no merged, possibly unaligned stores */
++#pragma GCC optimize("no-tree-vectorize")                /* no auto-NEON */
++
++#include <stdint.h>
++#include "zz9000_fbmem.h"
++
++#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
++#error zz9000_fbmem.c assumes a little-endian CPU
++#endif
++
++void *zz_fb_memset(void *dst, int c, size_t n)
++{
++	uint8_t *d = (uint8_t *)dst;
++	uint8_t b = (uint8_t)c;
++
++	while (n && ((uintptr_t)d & 3)) {
++		*d++ = b;
++		n--;
++	}
++	if (n >= 4) {
++		uint32_t v = b * 0x01010101u;
++		uint32_t *dw = (uint32_t *)d;
++		while (n >= 32) {
++			dw[0] = v; dw[1] = v; dw[2] = v; dw[3] = v;
++			dw[4] = v; dw[5] = v; dw[6] = v; dw[7] = v;
++			dw += 8;
++			n -= 32;
++		}
++		while (n >= 4) {
++			*dw++ = v;
++			n -= 4;
++		}
++		d = (uint8_t *)dw;
++	}
++	while (n--)
++		*d++ = b;
++	return dst;
++}
++
++static void copy_fwd(uint8_t *d, const uint8_t *s, size_t n)
++{
++	while (n && ((uintptr_t)d & 3)) {
++		*d++ = *s++;
++		n--;
++	}
++	if (n >= 4) {
++		uint32_t *dw = (uint32_t *)d;
++		unsigned k = (uintptr_t)s & 3;
++
++		if (!k) {
++			const uint32_t *sw = (const uint32_t *)s;
++			while (n >= 16) {
++				uint32_t a = sw[0], b = sw[1], c = sw[2], e = sw[3];
++				dw[0] = a; dw[1] = b; dw[2] = c; dw[3] = e;
++				dw += 4;
++				sw += 4;
++				n -= 16;
++			}
++			while (n >= 4) {
++				*dw++ = *sw++;
++				n -= 4;
++			}
++			s = (const uint8_t *)sw;
++		} else {
++			const uint32_t *sw = (const uint32_t *)(s - k);
++			unsigned rs = 8 * k, ls = 32 - rs;
++			uint32_t w0 = *sw++;
++			while (n >= 4) {
++				uint32_t w1 = *sw++;
++				*dw++ = (w0 >> rs) | (w1 << ls);
++				w0 = w1;
++				s += 4;
++				n -= 4;
++			}
++		}
++		d = (uint8_t *)dw;
++	}
++	while (n--)
++		*d++ = *s++;
++}
++
++static void copy_bwd(uint8_t *d, const uint8_t *s, size_t n)
++{
++	d += n;
++	s += n;
++	while (n && ((uintptr_t)d & 3)) {
++		*--d = *--s;
++		n--;
++	}
++	if (n >= 4) {
++		uint32_t *dw = (uint32_t *)d;
++		unsigned k = (uintptr_t)s & 3;
++
++		if (!k) {
++			const uint32_t *sw = (const uint32_t *)s;
++			while (n >= 4) {
++				*--dw = *--sw;
++				n -= 4;
++			}
++			s = (const uint8_t *)sw;
++		} else {
++			const uint32_t *sw = (const uint32_t *)(s - k);
++			unsigned rs = 8 * k, ls = 32 - rs;
++			uint32_t hi = *sw;
++			while (n >= 4) {
++				uint32_t lo = *--sw;
++				*--dw = (lo >> rs) | (hi << ls);
++				hi = lo;
++				s -= 4;
++				n -= 4;
++			}
++		}
++		d = (uint8_t *)dw;
++	}
++	while (n--)
++		*--d = *--s;
++}
++
++void *zz_fb_memcpy(void *dst, const void *src, size_t n)
++{
++	copy_fwd((uint8_t *)dst, (const uint8_t *)src, n);
++	return dst;
++}
++
++void *zz_fb_memmove(void *dst, const void *src, size_t n)
++{
++	uint8_t *d = (uint8_t *)dst;
++	const uint8_t *s = (const uint8_t *)src;
++
++	if (d == s || !n)
++		return dst;
++	if (d < s || d >= s + n)
++		copy_fwd(d, s, n);
++	else
++		copy_bwd(d, s, n);
++	return dst;
++}
+diff --git a/zz9000/mister/zz9000_fbmem.h b/zz9000/mister/zz9000_fbmem.h
+new file mode 100644
+index 00000000..97fdef6f
+--- /dev/null
++++ b/zz9000/mister/zz9000_fbmem.h
+@@ -0,0 +1,32 @@
++/*
++ * Framebuffer-safe memset/memcpy/memmove for the ZZ9000 blitter on MiSTer.
++ *
++ * The RTG framebuffer is DDR3 above the Linux RAM map, so the /dev/mem
++ * mapping the MiSTer binary gets is Strongly-ordered. ARMv7 faults every
++ * unaligned access to Strongly-ordered/Device memory (the kernel then
++ * emulates it, very slowly), and glibc's string routines freely use
++ * unaligned word accesses. These replacements only ever issue naturally
++ * aligned byte, halfword and word accesses, and use full 32-bit words for
++ * the bulk of every transfer regardless of the source/destination
++ * misalignment.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#ifndef ZZ9000_FBMEM_H
++#define ZZ9000_FBMEM_H
++
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++void *zz_fb_memset(void *dst, int c, size_t n);
++void *zz_fb_memcpy(void *dst, const void *src, size_t n);
++void *zz_fb_memmove(void *dst, const void *src, size_t n);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/zz9000/mister/zz9000_service.c b/zz9000/mister/zz9000_service.c
+new file mode 100644
+index 00000000..83b70e22
+--- /dev/null
++++ b/zz9000/mister/zz9000_service.c
+@@ -0,0 +1,114 @@
++/*
++ * MiSTer side of the ZZ9000-compatible RTG accelerator: mailbox service.
++ * Protocol: common/mister_zz9000.h.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#include <stdint.h>
++#include <string.h>
++
++#include "mister_zz9000.h"
++#include "zz9000_fbmem.h"
++#include "zz9000_service.h"
++#include "zz9000os/gfx.h"
++#include "zz9000os/video.h"
++
++/* Mailbox words are 4-byte aligned, so a plain aligned load/store is safe
++ * on the Strongly-ordered mapping. */
++static inline uint32_t mb_rd(const struct zz_service *s, uint32_t field)
++{
++	return __builtin_bswap32(*(volatile uint32_t *)(s->fb + MZZ_MBOX_OFFSET + field));
++}
++
++static inline void mb_wr(struct zz_service *s, uint32_t field, uint32_t v)
++{
++	*(volatile uint32_t *)(s->fb + MZZ_MBOX_OFFSET + field) = __builtin_bswap32(v);
++}
++
++unsigned zz_service_gfxdata_size(void)
++{
++	return sizeof(struct GFXData);
++}
++
++void zz_service_init(struct zz_service *s, uint8_t *fb, uint32_t fb_size, void *gfxdata)
++{
++	memset(s, 0, sizeof(*s));
++	s->fb = fb;
++	s->fb_size = fb_size;
++	s->gfxdata = gfxdata;
++}
++
++static int op_supported(uint32_t op)
++{
++	return op < 32 && (MZZ_CAPS_V1 & (1UL << op));
++}
++
++int zz_service_poll(struct zz_service *s)
++{
++	uint32_t magic = mb_rd(s, MZZ_MB_REQ_MAGIC);
++
++	if (magic != MZZ_REQ_MAGIC) {
++		/* 'ZM9Z': the 68k's words reached DDR3 byte-swapped, i.e. the core
++		 * does not have the RTG byte swap this port depends on. */
++		s->swapped = (magic == 0x5A4D395AUL);
++		s->attached = 0;
++		return ZZ_POLL_NO_DRIVER;
++	}
++
++	uint32_t session = mb_rd(s, MZZ_MB_SESSION);
++	if (!s->attached || session != s->session) {
++		s->session = session;
++		s->done = mb_rd(s, MZZ_MB_KICK);
++		s->attached = 1;
++		s->ops = s->rejected = 0;
++		mb_wr(s, MZZ_MB_VERSION, MZZ_PROTOCOL_VERSION);
++		mb_wr(s, MZZ_MB_CAPS, MZZ_CAPS_V1);
++		mb_wr(s, MZZ_MB_TAKEN, s->done);
++		mb_wr(s, MZZ_MB_DONE, s->done);
++		mb_wr(s, MZZ_MB_OPS, 0);
++		mb_wr(s, MZZ_MB_REJECTED, 0);
++		__sync_synchronize();
++		mb_wr(s, MZZ_MB_ACK_SESSION, session);
++		mb_wr(s, MZZ_MB_ACK_MAGIC, MZZ_ACK_MAGIC);
++		return ZZ_POLL_ATTACHED;
++	}
++
++	uint32_t kick = mb_rd(s, MZZ_MB_KICK);
++	if (kick == s->done)
++		return ZZ_POLL_IDLE;
++
++	uint32_t op = mb_rd(s, MZZ_MB_OP);
++	mb_wr(s, MZZ_MB_TAKEN, kick);
++
++	if (op_supported(op)) {
++		struct ZZ_VIDEO_STATE vs;
++
++		/* Snapshot only the command header; the dispatcher byte-swaps its
++		 * fields in place (upstream behaviour), which must never touch the
++		 * Amiga's copy. */
++		zz_fb_memcpy(s->gfxdata, s->fb + MZZ_GFXDATA_OFFSET, MZZ_GFXDATA_HEADER);
++		vs.framebuffer = (uint32_t *)s->fb;
++		vs.fb_size = s->fb_size;
++		vs.gfxdata = (struct GFXData *)s->gfxdata;
++		handle_blitter_dma_op(&vs, (uint16_t)op);
++		s->ops++;
++		mb_wr(s, MZZ_MB_OPS, s->ops);
++	} else {
++		s->rejected++;
++		mb_wr(s, MZZ_MB_REJECTED, s->rejected);
++	}
++	s->last_op = (uint16_t)op;
++
++	/* Every pixel store must be visible in DDR3 before the 68k sees DONE. */
++	__sync_synchronize();
++	mb_wr(s, MZZ_MB_DONE, kick);
++	s->done = kick;
++	return ZZ_POLL_OP;
++}
++
++void zz_service_heartbeat(struct zz_service *s)
++{
++	if (!s->attached)
++		return;
++	mb_wr(s, MZZ_MB_HEARTBEAT, ++s->heartbeat);
++}
+diff --git a/zz9000/mister/zz9000_service.h b/zz9000/mister/zz9000_service.h
+new file mode 100644
+index 00000000..6ae9f634
+--- /dev/null
++++ b/zz9000/mister/zz9000_service.h
+@@ -0,0 +1,54 @@
++/*
++ * MiSTer side of the ZZ9000-compatible RTG accelerator: mailbox service.
++ *
++ * Pure function of a mapped RTG window, so the same code runs in the MiSTer
++ * main binary (minimig_zz9000.cpp maps /dev/mem and calls it from a thread)
++ * and in the host test harness (tests/, plain malloc'd buffer).
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#ifndef ZZ9000_SERVICE_H
++#define ZZ9000_SERVICE_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum zz_poll_result {
++	ZZ_POLL_NO_DRIVER = -1,   /* no REQ_MAGIC: Amiga driver not running */
++	ZZ_POLL_IDLE      = 0,
++	ZZ_POLL_ATTACHED  = 1,    /* attached to a new driver session */
++	ZZ_POLL_OP        = 2,    /* executed one op */
++};
++
++struct zz_service {
++	uint8_t  *fb;             /* RTG board offset 0 */
++	uint32_t  fb_size;        /* MZZ_FB_SIZE */
++	uint32_t  session;        /* attached session (valid if attached) */
++	uint32_t  done;           /* last KICK completed */
++	int       attached;
++	int       swapped;        /* REQ_MAGIC seen byte-swapped: refuse */
++	uint32_t  heartbeat;
++	uint32_t  ops;
++	uint32_t  rejected;
++	uint16_t  last_op;
++	void     *gfxdata;        /* private struct GFXData snapshot */
++};
++
++/* gfxdata must point at sizeof(struct GFXData) bytes (zz_service_gfxdata_size()). */
++void zz_service_init(struct zz_service *s, uint8_t *fb, uint32_t fb_size, void *gfxdata);
++unsigned zz_service_gfxdata_size(void);
++
++/* One mailbox check: attach to a new session, or run one pending op. */
++int  zz_service_poll(struct zz_service *s);
++
++/* Bump the heartbeat word (call every ~100ms while attached). */
++void zz_service_heartbeat(struct zz_service *s);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/zz9000/mister/zz9000os/dma_rtg.c b/zz9000/mister/zz9000os/dma_rtg.c
+index 1adb0ede..5cd3b804 100644
+--- a/zz9000/mister/zz9000os/dma_rtg.c
++++ b/zz9000/mister/zz9000os/dma_rtg.c
+@@ -1,22 +1,48 @@
+-#include <stdio.h>
+-#include <xil_types.h>
+-#include "memorymap.h"
++/*
++ * ZZ9000OS blitter command dispatcher, MiSTer Minimig port.
++ *
++ * Upstream: BlitterStudio/zz9000-firmware ZZ9000OS/src/dma_rtg.c. The RTG
++ * blit cases are kept as upstream wrote them. MiSTer changes:
++ *  - the GFXData block is a private snapshot taken by minimig_zz9000.cpp
++ *    (vs->gfxdata), not the Zynq aperture, so the in-place SWAPs below never
++ *    touch shared memory;
++ *  - every Amiga-supplied offset is range checked against the mapped RTG
++ *    window before any pointer is formed (a wild pointer would crash the
++ *    MiSTer main binary, not just the blit);
++ *  - display/sprite/palette/YUV/overlay ops are dropped: the Minimig RTG
++ *    board has no ZZ video formatter. Panning and the CLUT are programmed
++ *    by the Amiga driver directly through the core's rtg.v registers.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#include <stdint.h>
+ #include "zz_video_modes.h"
+ #include "gfx.h"
+ #include "video.h"
+-#include "overlay.h"
+-#include "sdk_palette.h"
+-#include "sdk_aperture_layout.h"
+-#include "xil_printf.h"
++
++
++/* [off, off+len) inside the RTG window? 64-bit math: no wrap tricks. */
++static int zz_range_ok(const struct ZZ_VIDEO_STATE *vs, uint64_t off, uint64_t len)
++{
++    return off <= vs->fb_size && len <= (uint64_t)vs->fb_size - off;
++}
++
++/* Source rectangle of a word-pitch (copy) op: rows 0..sy+h-1 of the source. */
++static int zz_src_rows_ok(const struct ZZ_VIDEO_STATE *vs, uint32_t off,
++        uint32_t pitch_bytes, uint32_t rows)
++{
++    return zz_range_ok(vs, off, (uint64_t)pitch_bytes * rows);
++}
+ 
+ void handle_blitter_dma_op(struct ZZ_VIDEO_STATE* vs, uint16_t zdata)
+ {
+-    u32 gfxdata = sdk_aperture_gfxdata_address(Z3_SCRATCH_ADDR);
+-    struct GFXData *data;
++    struct GFXData *data = vs->gfxdata;
+ 
+-    if (gfxdata == 0U)
++    if (!data || !vs->framebuffer)
+         return;
+-    data = (struct GFXData *)gfxdata;
++    /* Destination writes are clamped to the end of the RTG window by the
++     * renderers' own fb_limit bound. */
++    set_fb_limit((uint8_t *)vs->framebuffer + vs->fb_size);
+     switch(zdata) {
+         case OP_DRAWLINE:
+             SWAP16(data->x[0]);		SWAP16(data->x[1]);
+@@ -26,8 +52,10 @@ void handle_blitter_dma_op(struct ZZ_VIDEO_STATE* vs, uint16_t zdata)
+ 
+             SWAP16(data->pitch[0]);
+             SWAP32(data->offset[0]);
++            if (!zz_range_ok(vs, data->offset[0], 0))
++                break;
+ 
+-            set_fb_words((uint32_t*) ((u32)vs->framebuffer + data->offset[0]),
++            set_fb_words((uint32_t*) ((uintptr_t)vs->framebuffer + data->offset[0]),
+                     data->pitch[0]);
+ 
+             if (line_uses_solid_path(data->user[1], data->mask,
+@@ -54,8 +82,10 @@ void handle_blitter_dma_op(struct ZZ_VIDEO_STATE* vs, uint16_t zdata)
+ 
+             SWAP16(data->pitch[0]);
+             SWAP32(data->offset[0]);
++            if (!zz_range_ok(vs, data->offset[0], 0))
++                break;
+ 
+-            set_fb_words((uint32_t*) ((u32)vs->framebuffer + data->offset[0]),
++            set_fb_words((uint32_t*) ((uintptr_t)vs->framebuffer + data->offset[0]),
+                     data->pitch[0]);
+ 
+             if (data->mask == 0xFF)
+@@ -73,8 +103,18 @@ void handle_blitter_dma_op(struct ZZ_VIDEO_STATE* vs, uint16_t zdata)
+ 
+             SWAP16(data->pitch[0]);		SWAP16(data->pitch[1]);
+             SWAP32(data->offset[0]);	SWAP32(data->offset[1]);
++            if (!zz_range_ok(vs, data->offset[0], 0))
++                break;
++            /* Source rows sy..sy+h-1, word pitch (BlitRect reuses the dest
++             * RenderInfo, NoMaskComplete brings its own). */
++            if (zdata == OP_COPYRECT ?
++                    !zz_src_rows_ok(vs, data->offset[0], data->pitch[0] * 4U,
++                        (uint32_t)data->y[2] + data->y[1]) :
++                    !zz_src_rows_ok(vs, data->offset[1], data->pitch[1] * 4U,
++                        (uint32_t)data->y[2] + data->y[1]))
++                break;
+ 
+-            set_fb_words((uint32_t*) ((u32)vs->framebuffer + data->offset[0]),
++            set_fb_words((uint32_t*) ((uintptr_t)vs->framebuffer + data->offset[0]),
+                     data->pitch[0]);
+ 
+             switch (zdata) {
+@@ -82,18 +122,18 @@ void handle_blitter_dma_op(struct ZZ_VIDEO_STATE* vs, uint16_t zdata)
+                 if (data->mask == 0xFF || (data->mask != 0xFF && data->u8_user[GFXDATA_U8_COLORMODE] != MNTVA_COLOR_8BIT))
+                     copy_rect_nomask(data->x[0], data->y[0], data->x[1], data->y[1], data->x[2],
+                                     data->y[2], data->u8_user[GFXDATA_U8_COLORMODE],
+-                                    (uint32_t*) ((u32)vs->framebuffer + data->offset[0]),
++                                    (uint32_t*) ((uintptr_t)vs->framebuffer + data->offset[0]),
+                                     data->pitch[0], MINTERM_SRC);
+                 else
+                     copy_rect(data->x[0], data->y[0], data->x[1], data->y[1], data->x[2],
+                             data->y[2], data->u8_user[GFXDATA_U8_COLORMODE],
+-                            (uint32_t*) ((u32)vs->framebuffer + data->offset[0]),
++                            (uint32_t*) ((uintptr_t)vs->framebuffer + data->offset[0]),
+                             data->pitch[0], data->mask);
+                 break;
+             case 4: // BlitRectNoMaskComplete
+                 copy_rect_nomask(data->x[0], data->y[0], data->x[1], data->y[1], data->x[2],
+                                 data->y[2], data->u8_user[GFXDATA_U8_COLORMODE],
+-                                (uint32_t*) ((u32)vs->framebuffer + data->offset[1]),
++                                (uint32_t*) ((uintptr_t)vs->framebuffer + data->offset[1]),
+                                 data->pitch[1], data->minterm);
+                 break;
+             }
+@@ -106,10 +146,21 @@ void handle_blitter_dma_op(struct ZZ_VIDEO_STATE* vs, uint16_t zdata)
+ 
+             SWAP16(data->pitch[0]);		SWAP16(data->pitch[1]);
+             SWAP32(data->offset[0]);	SWAP32(data->offset[1]);
++            if (!zz_range_ok(vs, data->offset[0], 0))
++                break;
++            if (zdata == OP_RECT_PATTERN) {
++                /* 16 pixels wide, user[0] (= 1 << Pattern.Size) rows. */
++                if (!zz_range_ok(vs, data->offset[1],
++                        2U * __builtin_bswap16(data->user[0])))
++                    break;
++            } else if (!zz_range_ok(vs, data->offset[1],
++                    (uint64_t)data->pitch[1] * data->y[1])) {
++                break;
++            }
+ 
+-            uint8_t* tmpl_data = (uint8_t*) ((u32)vs->framebuffer
++            uint8_t* tmpl_data = (uint8_t*) ((uintptr_t)vs->framebuffer
+                     + data->offset[1]);
+-            set_fb_bytes((uint32_t*) ((u32)vs->framebuffer + data->offset[0]),
++            set_fb_bytes((uint32_t*) ((uintptr_t)vs->framebuffer + data->offset[0]),
+                     data->pitch[0]);
+ 
+ 
+@@ -150,10 +201,19 @@ void handle_blitter_dma_op(struct ZZ_VIDEO_STATE* vs, uint16_t zdata)
+             SWAP16(data->user[0]);
+             SWAP16(data->user[1]);
+ 
+-            uint8_t* bmp_data = (uint8_t*) ((u32)vs->framebuffer
++            if (!zz_range_ok(vs, data->offset[0], 0) || data->user[1] > 8)
++                break;
++            /* user[1] planes of pitch[1] * h bytes; P2D prefixes a 256-entry
++             * 32-bit colour table. */
++            if (!zz_range_ok(vs, data->offset[1],
++                    (zdata == OP_P2D ? 1024U : 0U) +
++                    (uint64_t)data->pitch[1] * data->y[2] * data->user[1]))
++                break;
++
++            uint8_t* bmp_data = (uint8_t*) ((uintptr_t)vs->framebuffer
+                     + data->offset[1]);
+ 
+-            set_fb_words((uint32_t*) ((u32)vs->framebuffer + data->offset[0]),
++            set_fb_words((uint32_t*) ((uintptr_t)vs->framebuffer + data->offset[0]),
+                     data->pitch[0]);
+ 
+             if (zdata == OP_P2C) {
+@@ -169,159 +229,21 @@ void handle_blitter_dma_op(struct ZZ_VIDEO_STATE* vs, uint16_t zdata)
+             break;
+         }
+ 
+-        case OP_WRITE_YUV: {
+-            SWAP16(data->x[0]);		SWAP16(data->x[1]);		SWAP16(data->x[2]);
+-            SWAP16(data->y[1]);		SWAP16(data->y[2]);
+-
+-            SWAP16(data->pitch[0]);		SWAP16(data->pitch[1]);
+-            SWAP32(data->offset[0]);	SWAP32(data->offset[1]);
+-
+-            uint8_t* yuv_data = (uint8_t*) ((u32)vs->framebuffer
+-                    + data->offset[1]);
+-
+-            set_fb_words((uint32_t*) ((u32)vs->framebuffer + data->offset[0]),
+-                    data->pitch[0]);
+-
+-            yuv422_to_rgb_rect((int16_t)data->x[0], (int16_t)data->x[1],
+-                    (int16_t)data->y[1], (int16_t)data->x[2], (int16_t)data->y[2],
+-                    data->u8_user[GFXDATA_U8_YUV_VARIANT],
+-                    data->u8_user[GFXDATA_U8_COLORMODE],
+-                    data->pitch[1], yuv_data);
+-            break;
+-        }
+-
+-        case OP_VIDEO_OVERLAY: {
+-            SWAP16(data->x[0]);		SWAP16(data->x[1]);		SWAP16(data->x[2]);
+-            SWAP16(data->y[0]);		SWAP16(data->y[1]);		SWAP16(data->y[2]);
+-            SWAP16(data->pitch[1]);
+-            SWAP16(data->user[0]);
+-            SWAP32(data->offset[1]);
+-            /* u32_user[1] (color key) deliberately NOT swapped: it uses
+-             * the pen convention, see overlay_handle_op */
+-
+-            overlay_handle_op(vs, data);
+-            break;
+-        }
+-
+         case OP_INVERTRECT:
+             SWAP16(data->x[0]);		SWAP16(data->x[1]);
+             SWAP16(data->y[0]);		SWAP16(data->y[1]);
+ 
+             SWAP16(data->pitch[0]);
+             SWAP32(data->offset[0]);
++            if (!zz_range_ok(vs, data->offset[0], 0))
++                break;
+ 
+-            set_fb_words((uint32_t*) ((u32)vs->framebuffer + data->offset[0]),
++            set_fb_words((uint32_t*) ((uintptr_t)vs->framebuffer + data->offset[0]),
+                     data->pitch[0]);
+             invert_rect(data->x[0], data->y[0], data->x[1], data->y[1],
+                     data->mask, data->u8_user[GFXDATA_U8_COLORMODE]);
+             break;
+ 
+-        case OP_SPRITE_XY:
+-            if (!vs->sprite_showing)
+-                break;
+-
+-            SWAP16(data->x[0]);     SWAP16(data->y[0]);
+-
+-            vs->sprite_x_base = (int16_t)data->x[0];
+-            vs->sprite_y_base = (int16_t)data->y[0];
+-
+-            update_hw_sprite_pos();
+-            break;
+-
+-        case OP_SPRITE_CLUT_BITMAP:
+-        case OP_SPRITE_BITMAP: {
+-            SWAP16(data->x[0]);		SWAP16(data->x[1]);
+-            SWAP16(data->y[0]);		SWAP16(data->y[1]);
+-
+-            SWAP32(data->offset[1]);
+-
+-            uint8_t* bmp_data;
+-
+-            if (zdata == OP_SPRITE_BITMAP)
+-                bmp_data = (uint8_t*) ((u32)vs->framebuffer + data->offset[1]);
+-            else
+-                bmp_data = (uint8_t*) ((u32) ADDR_ADJ + data->offset[1]);
+-
+-            clear_hw_sprite();
+-
+-            int double_sprite = (data->x[1] >> 8) & 1;
+-            int hires_sprite = (data->y[1] >> 8) & 1;
+-
+-            vs->sprite_x_offset = (int16_t)data->x[0];
+-            vs->sprite_y_offset = (int16_t)data->y[0];
+-            vs->sprite_width  = data->x[1];
+-            if (zdata == OP_SPRITE_CLUT_BITMAP) {
+-            	vs->sprite_x_offset = -(vs->sprite_x_offset);
+-            	vs->sprite_y_offset = -(vs->sprite_y_offset);
+-            }
+-            vs->sprite_height = data->y[1];
+-
+-            if (zdata == OP_SPRITE_BITMAP) {
+-                update_hw_sprite(bmp_data, double_sprite, hires_sprite);
+-            }
+-            else {
+-                //printf("Making a %dx%d cursor (%i %i)\n", sprite_width, sprite_height, sprite_x_offset, sprite_y_offset);
+-                update_hw_sprite_clut(bmp_data, data->clut1,
+-                		vs->sprite_width, vs->sprite_height, data->u8offset);
+-            }
+-            update_hw_sprite_pos();
+-            break;
+-        }
+-        case OP_SPRITE_COLOR: {
+-            vs->sprite_colors[data->u8offset] = data->rgb[0];
+-            if (data->u8offset != 0 && vs->sprite_colors[data->u8offset] == 0xff00ff)
+-            	vs->sprite_colors[data->u8offset] = 0xfe00fe;
+-            break;
+-        }
+-
+-        case OP_PAN:
+-            SWAP32(data->offset[0]);
+-            SWAP16(data->x[0]);
+-            SWAP16(data->y[0]);
+-            SWAP16(data->x[1]);
+-
+-            vs->sprite_x_offset = (int16_t)data->x[0];
+-            vs->sprite_y_offset = (int16_t)data->y[0];
+-
+-            vs->framebuffer_pan_width = data->x[1];
+-            u32 framebuffer_color_format = data->u8_user[GFXDATA_U8_COLORMODE];
+-            vs->framebuffer_pan_offset = data->offset[0] + (((int16_t)data->x[0]) << data->u8_user[GFXDATA_U8_COLORMODE]);
+-            vs->framebuffer_pan_offset += (((int16_t)data->y[0]) * (vs->framebuffer_pan_width << framebuffer_color_format));
+-            break;
+-
+-        case OP_SET_SPLIT_POS:
+-            SWAP16(data->y[0]);
+-            SWAP32(data->offset[0]);
+-            vs->bgbuf_offset = data->offset[0];
+-
+-            vs->split_request_pos = data->y[0];
+-            break;
+-
+-        case OP_SET_PALETTE: {
+-            SWAP16(data->user[0]);
+-            SWAP16(data->user[1]);
+-            uint16_t start = data->user[0];
+-            uint16_t count = data->user[1];
+-            uint8_t secondary = data->u8_user[0];
+-            uint16_t op = secondary ? 19 : 3;
+-
+-            if (count > 256) count = 256;
+-
+-            for (uint16_t i = 0; i < count; i++) {
+-                uint32_t idx = (start + i) & 0xFF;
+-                uint32_t r = data->clut1[i * 3];
+-                uint32_t g = data->clut1[i * 3 + 1];
+-                uint32_t b = data->clut1[i * 3 + 2];
+-                uint32_t xrgb = (idx << 24) | (r << 16) | (g << 8) | b;
+-                video_formatter_write(xrgb, op);
+-                /* Shadow the primary CLUT so SDK_OP_QUERY_PALETTE has
+-                 * something to read: the hardware registers are write-only. */
+-                if (!secondary)
+-                    sdk_palette_set(idx, xrgb);
+-            }
+-            break;
+-        }
+-
+         default:
+             break;
+     }
+diff --git a/zz9000/mister/zz9000os/video.h b/zz9000/mister/zz9000os/video.h
+new file mode 100644
+index 00000000..fd05ef27
+--- /dev/null
++++ b/zz9000/mister/zz9000os/video.h
+@@ -0,0 +1,25 @@
++/*
++ * MiSTer shim for the ZZ9000OS video.h.
++ *
++ * The official gfx.h includes "video.h" only for struct ZZ_VIDEO_STATE,
++ * which the blitter dispatcher (dma_rtg.c) uses for the framebuffer base.
++ * On MiSTer there is no ZZ9000 video formatter: the framebuffer is the
++ * Minimig Z3 RTG board's DDR3 window, mapped by minimig_zz9000.cpp.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#ifndef ZZ_VIDEO_H
++#define ZZ_VIDEO_H
++
++#include <stdint.h>
++#include "zz_video_modes.h"
++
++struct GFXData;
++
++struct ZZ_VIDEO_STATE {
++	uint32_t *framebuffer;   /* ARM view of RTG board offset 0 */
++	uint32_t fb_size;        /* bytes mapped at framebuffer */
++	struct GFXData *gfxdata; /* private snapshot of the Amiga's GFXData */
++};
++
++#endif
+diff --git a/zz9000/tests/host/.gitignore b/zz9000/tests/host/.gitignore
+new file mode 100644
+index 00000000..3bca3522
+--- /dev/null
++++ b/zz9000/tests/host/.gitignore
+@@ -0,0 +1,2 @@
++zz9000_host_test
++*.dSYM/
+diff --git a/zz9000/tests/host/Makefile b/zz9000/tests/host/Makefile
+new file mode 100644
+index 00000000..771df48e
+--- /dev/null
++++ b/zz9000/tests/host/Makefile
+@@ -0,0 +1,21 @@
++# Host build of the MiSTer-side ZZ9000 blitter service + tests.
++#   make        build and run under AddressSanitizer/UBSan
++ROOT    := ../..
++CFLAGS  ?= -std=gnu99 -O1 -g -Wall -Wno-unused-function
++SAN     := -fsanitize=address,undefined -fno-omit-frame-pointer
++INC     := -I$(ROOT)/common -I$(ROOT)/mister
++SRC     := zz9000_host_test.c $(ROOT)/mister/zz9000_service.c \
++           $(ROOT)/mister/zz9000_blit.c $(ROOT)/mister/zz9000_fbmem.c
++
++all: test
++
++zz9000_host_test: $(SRC) $(wildcard $(ROOT)/mister/*.h $(ROOT)/mister/zz9000os/*) $(ROOT)/common/mister_zz9000.h
++	$(CC) $(CFLAGS) $(SAN) $(INC) -o $@ $(SRC) -lm
++
++test: zz9000_host_test
++	./zz9000_host_test
++
++clean:
++	rm -f zz9000_host_test
++
++.PHONY: all test clean
+diff --git a/zz9000/tests/host/zz9000_host_test.c b/zz9000/tests/host/zz9000_host_test.c
+new file mode 100644
+index 00000000..04dfb900
+--- /dev/null
++++ b/zz9000/tests/host/zz9000_host_test.c
+@@ -0,0 +1,568 @@
++/*
++ * Host-side tests for the MiSTer ZZ9000 blitter service.
++ *
++ * Builds the exact ARM-side code (zz9000_service.c + zz9000_blit.c, i.e.
++ * the official ZZ9000OS gfx.c and the adapted dma_rtg.c, + zz9000_fbmem.c)
++ * for the host and drives it the way the 68k driver does: big-endian
++ * GFXData fields and mailbox words written into an 8MB "RTG window", then
++ * one zz_service_poll(). Results are compared against small independent
++ * reference renderers written from the Picasso96 semantics.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "mister_zz9000.h"
++#include "zz9000_fbmem.h"
++#include "zz9000_service.h"
++
++/* enum gfx_dma_op / MNTVA colour modes (zz9000os/gfx.h, zz_video_modes.h) */
++enum { OP_DRAWLINE = 1, OP_FILLRECT, OP_COPYRECT, OP_COPYRECT_NOMASK,
++	OP_RECT_TEMPLATE, OP_RECT_PATTERN, OP_P2C, OP_P2D, OP_INVERTRECT, OP_PAN };
++enum { CM8 = 0, CM16 = 1, CM32 = 2, CM15 = 3 };
++enum { JAM1 = 0, JAM2 = 1, COMPLEMENT = 2, INVERSVID = 4 };
++enum { MT_EOR = 6, MT_SRC = 12 };
++
++/* GFXData byte offsets (official layout, identical on m68k and ARM) */
++#define G_OFFSET(i) (0x00 + 4 * (i))
++#define G_RGB(i)    (0x08 + 4 * (i))
++#define G_X(i)      (0x10 + 2 * (i))
++#define G_Y(i)      (0x18 + 2 * (i))
++#define G_USER(i)   (0x20 + 2 * (i))
++#define G_PITCH(i)  (0x28 + 2 * (i))
++#define G_U8(i)     (0x30 + (i))
++#define G_MASK      0x39
++#define G_MINTERM   0x3A
++
++static uint8_t *fb;
++static struct zz_service svc;
++static int failures, checks;
++static uint32_t kick;
++
++#define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; \
++	printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
++
++/* ---- 68k-side writers (big-endian) ------------------------------------ */
++static void be32(uint32_t off, uint32_t v) { fb[off] = v >> 24; fb[off+1] = v >> 16; fb[off+2] = v >> 8; fb[off+3] = v; }
++static void be16(uint32_t off, uint16_t v) { fb[off] = v >> 8; fb[off+1] = v; }
++static uint32_t rd_be32(uint32_t off) { return (uint32_t)fb[off] << 24 | fb[off+1] << 16 | fb[off+2] << 8 | fb[off+3]; }
++static void mb(uint32_t f, uint32_t v) { be32(MZZ_MBOX_OFFSET + f, v); }
++static uint32_t mbr(uint32_t f) { return rd_be32(MZZ_MBOX_OFFSET + f); }
++static void g32(uint32_t f, uint32_t v) { be32(MZZ_GFXDATA_OFFSET + f, v); }
++static void g16(uint32_t f, uint16_t v) { be16(MZZ_GFXDATA_OFFSET + f, v); }
++static void g8(uint32_t f, uint8_t v) { fb[MZZ_GFXDATA_OFFSET + f] = v; }
++
++static void attach(void)
++{
++	memset(fb + MZZ_MBOX_OFFSET, 0, MZZ_MB_SIZE);
++	mb(MZZ_MB_SESSION, 0x1234 + kick);
++	mb(MZZ_MB_KICK, kick);
++	mb(MZZ_MB_REQ_MAGIC, MZZ_REQ_MAGIC);
++	int r = zz_service_poll(&svc);
++	CHECK(r == ZZ_POLL_ATTACHED, "attach returned %d", r);
++}
++
++/* Submit one op exactly like the driver's mister_kick() and run it. */
++static void run(uint32_t op)
++{
++	mb(MZZ_MB_OP, op);
++	mb(MZZ_MB_KICK, ++kick);
++	int r = zz_service_poll(&svc);
++	CHECK(r == ZZ_POLL_OP, "op %u: poll returned %d", op, r);
++	CHECK(mbr(MZZ_MB_DONE) == kick, "op %u: DONE %u != KICK %u", op, mbr(MZZ_MB_DONE), kick);
++	CHECK(zz_service_poll(&svc) == ZZ_POLL_IDLE, "op %u: not idle afterwards", op);
++}
++
++/* ---- framebuffer helpers ------------------------------------------------ */
++#define SCR   0x100000u   /* test "screen" at board offset 1MB */
++#define SCR2  0x300000u   /* second bitmap */
++#define PITCH 1024u       /* bytes per row, multiple of 4 as P96 gives */
++
++static uint8_t *ref;      /* reference copy of the window */
++
++static void fill_noise(uint32_t seed)
++{
++	for (uint32_t i = 0; i < MZZ_P96_MEMORY_SIZE; i++) {
++		seed = seed * 1103515245u + 12345u;
++		fb[i] = seed >> 16;
++	}
++	memcpy(ref, fb, MZZ_P96_MEMORY_SIZE);
++}
++
++static int compare(const char *what)
++{
++	for (uint32_t i = 0; i < MZZ_P96_MEMORY_SIZE; i++) {
++		if (fb[i] != ref[i]) {
++			uint32_t o = i - SCR;
++			printf("  %s: first mismatch at board+0x%06X (scr row %u col-byte %u): got %02X want %02X\n",
++				what, i, o / PITCH, o % PITCH, fb[i], ref[i]);
++			return 0;
++		}
++	}
++	return 1;
++}
++
++static int bpp_of(int cm) { return cm == CM8 ? 1 : cm == CM32 ? 4 : 2; }
++
++/* Pixel store in Amiga byte order: the value as the 68k would hold it. */
++static void ref_put(uint32_t base, int cm, int x, int y, uint32_t v)
++{
++	uint8_t *p = ref + base + y * PITCH + x * bpp_of(cm);
++	switch (bpp_of(cm)) {
++	case 1: p[0] = v; break;
++	case 2: p[0] = v >> 8; p[1] = v; break;
++	case 4: p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; break;
++	}
++}
++
++static uint32_t ref_get(uint32_t base, int cm, int x, int y)
++{
++	uint8_t *p = ref + base + y * PITCH + x * bpp_of(cm);
++	switch (bpp_of(cm)) {
++	case 1: return p[0];
++	case 2: return (uint32_t)p[0] << 8 | p[1];
++	default: return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3];
++	}
++}
++
++/* Picasso96 hands pens to the board already in the screen format and
++ * replicated across the ULONG (8bit: cccccccc, 16bit: hhhhhhhh). */
++static uint32_t pen(int cm, uint32_t v)
++{
++	switch (bpp_of(cm)) {
++	case 1: return (v & 0xFF) * 0x01010101u;
++	case 2: return (v & 0xFFFF) * 0x00010001u;
++	default: return v;
++	}
++}
++
++/* ---- tests -------------------------------------------------------------- */
++
++static void test_fbmem(void)
++{
++	uint8_t a[300], b[300], c[300];
++	uint32_t seed = 1;
++	for (int iter = 0; iter < 20000; iter++) {
++		for (int i = 0; i < 300; i++) { seed = seed * 1664525u + 1013904223u; a[i] = seed >> 24; }
++		memcpy(b, a, 300);
++		memcpy(c, a, 300);
++		seed = seed * 1664525u + 1013904223u;
++		int d = (seed >> 8) % 140, s = (seed >> 16) % 140, n = (seed >> 24) % 150;
++		switch (iter % 3) {
++		case 0: zz_fb_memmove(b + d, b + s, n); memmove(c + d, c + s, n); break;
++		case 1: if (abs(d - s) >= n) { zz_fb_memcpy(b + d, a + s, n); memcpy(c + d, a + s, n); } break;
++		case 2: zz_fb_memset(b + d, s, n); memset(c + d, s, n); break;
++		}
++		if (memcmp(b, c, 300)) {
++			CHECK(0, "fbmem mode %d d=%d s=%d n=%d", iter % 3, d, s, n);
++			return;
++		}
++	}
++	CHECK(1, "fbmem");
++}
++
++static void test_handshake(void)
++{
++	memset(fb + MZZ_MBOX_OFFSET, 0, MZZ_MB_SIZE);
++	CHECK(zz_service_poll(&svc) == ZZ_POLL_NO_DRIVER, "no driver");
++	CHECK(mbr(MZZ_MB_ACK_MAGIC) == 0, "ARM wrote before request");
++
++	/* Byte-swapped request (core without the RTG byte swap): refuse. */
++	fb[MZZ_MBOX_OFFSET + 0] = 'Z'; fb[MZZ_MBOX_OFFSET + 1] = 'M';
++	fb[MZZ_MBOX_OFFSET + 2] = '9'; fb[MZZ_MBOX_OFFSET + 3] = 'Z';
++	CHECK(zz_service_poll(&svc) == ZZ_POLL_NO_DRIVER && svc.swapped, "swapped magic");
++	CHECK(mbr(MZZ_MB_ACK_MAGIC) == 0, "ARM attached to swapped request");
++
++	kick = 77;
++	attach();
++	CHECK(mbr(MZZ_MB_ACK_MAGIC) == MZZ_ACK_MAGIC, "ack magic");
++	CHECK(mbr(MZZ_MB_ACK_SESSION) == 0x1234 + 77, "ack session");
++	CHECK(mbr(MZZ_MB_DONE) == 77, "done follows kick at attach");
++	CHECK(mbr(MZZ_MB_VERSION) == MZZ_PROTOCOL_VERSION, "version");
++	CHECK(mbr(MZZ_MB_CAPS) == MZZ_CAPS_V1, "caps");
++	CHECK(zz_service_poll(&svc) == ZZ_POLL_IDLE, "idle after attach");
++
++	/* New session (Amiga reboot) re-attaches. */
++	mb(MZZ_MB_SESSION, 999);
++	CHECK(zz_service_poll(&svc) == ZZ_POLL_ATTACHED, "re-attach on new session");
++
++	/* Unknown op: rejected but completed, so the 68k never hangs. */
++	run(OP_PAN);
++	CHECK(mbr(MZZ_MB_REJECTED) == 1, "pan rejected");
++}
++
++static void setup_rect_common(uint32_t dst, uint32_t pitch_words, int cm, uint8_t mask)
++{
++	g32(G_OFFSET(0), dst);
++	g16(G_PITCH(0), pitch_words);
++	g8(G_U8(0), cm);
++	g8(G_MASK, mask);
++}
++
++static void test_fillrect(void)
++{
++	static const int cms[] = { CM8, CM16, CM32 };
++	for (int i = 0; i < 3; i++) {
++		int cm = cms[i];
++		for (int masked = 0; masked < 2; masked++) {
++			uint8_t mask = (masked && cm == CM8) ? 0x3C : 0xFF;
++			uint32_t col = cm == CM8 ? 0xA5 : cm == CM16 ? 0xF81F : 0x11223344;
++			fill_noise(10 + i);
++			int x = 3, y = 5, w = 37, h = 11;
++			setup_rect_common(SCR, PITCH / 4, cm, mask);
++			g32(G_RGB(0), pen(cm, col));
++			g16(G_X(0), x); g16(G_X(1), w); g16(G_Y(0), y); g16(G_Y(1), h);
++			run(OP_FILLRECT);
++			for (int yy = y; yy < y + h; yy++)
++				for (int xx = x; xx < x + w; xx++) {
++					uint32_t v = col;
++					if (cm == CM8) v = (ref_get(SCR, cm, xx, yy) & ~mask) | (col & mask);
++					ref_put(SCR, cm, xx, yy, v);
++				}
++			char what[64];
++			snprintf(what, sizeof what, "fillrect cm%d mask %02X", cm, mask);
++			CHECK(compare(what), "%s", what);
++		}
++	}
++}
++
++static void test_invertrect(void)
++{
++	fill_noise(20);
++	setup_rect_common(SCR, PITCH / 4, CM8, 0x0F);
++	g16(G_X(0), 1); g16(G_X(1), 30); g16(G_Y(0), 2); g16(G_Y(1), 7);
++	run(OP_INVERTRECT);
++	for (int y = 2; y < 9; y++)
++		for (int x = 1; x < 31; x++)
++			ref_put(SCR, CM8, x, y, ref_get(SCR, CM8, x, y) ^ 0x0F);
++	CHECK(compare("invertrect 8bit"), "invertrect 8bit");
++
++	fill_noise(21);
++	setup_rect_common(SCR, PITCH / 4, CM16, 0xFF);
++	g16(G_X(0), 5); g16(G_X(1), 9); g16(G_Y(0), 0); g16(G_Y(1), 3);
++	run(OP_INVERTRECT);
++	for (int y = 0; y < 3; y++)
++		for (int x = 5; x < 14; x++)
++			ref_put(SCR, CM16, x, y, ref_get(SCR, CM16, x, y) ^ 0xFFFF);
++	CHECK(compare("invertrect 16bit"), "invertrect 16bit");
++}
++
++/* BlitRect within one bitmap, all overlap directions. */
++static void test_blitrect(void)
++{
++	static const int d[][2] = { { 3, 2 }, { -3, -2 }, { 5, -1 }, { -1, 4 }, { 1, 0 }, { 0, 1 } };
++	static const int cms[] = { CM8, CM16, CM32 };
++	for (int c = 0; c < 3; c++)
++		for (unsigned k = 0; k < sizeof d / sizeof d[0]; k++) {
++			int cm = cms[c];
++			fill_noise(30 + k + 10 * c);
++			int sx = 10, sy = 10, w = 41, h = 13, dx = sx + d[k][0], dy = sy + d[k][1];
++			setup_rect_common(SCR, PITCH / 4, cm, 0xFF);
++			g32(G_OFFSET(1), SCR);
++			g16(G_X(2), sx); g16(G_Y(2), sy);
++			g16(G_X(0), dx); g16(G_Y(0), dy);
++			g16(G_X(1), w); g16(G_Y(1), h);
++			run(OP_COPYRECT);
++			uint32_t *tmp = malloc(w * h * 4);
++			for (int y = 0; y < h; y++)
++				for (int x = 0; x < w; x++)
++					tmp[y * w + x] = ref_get(SCR, cm, sx + x, sy + y);
++			for (int y = 0; y < h; y++)
++				for (int x = 0; x < w; x++)
++					ref_put(SCR, cm, dx + x, dy + y, tmp[y * w + x]);
++			free(tmp);
++			char what[64];
++			snprintf(what, sizeof what, "blitrect cm%d d=(%d,%d)", cm, d[k][0], d[k][1]);
++			CHECK(compare(what), "%s", what);
++		}
++
++	/* 8bit with a plane mask */
++	fill_noise(39);
++	setup_rect_common(SCR, PITCH / 4, CM8, 0xF0);
++	g16(G_X(2), 0); g16(G_Y(2), 0); g16(G_X(0), 50); g16(G_Y(0), 40);
++	g16(G_X(1), 20); g16(G_Y(1), 5);
++	run(OP_COPYRECT);
++	for (int y = 0; y < 5; y++)
++		for (int x = 0; x < 20; x++)
++			ref_put(SCR, CM8, 50 + x, 40 + y,
++				(ref_get(SCR, CM8, 50 + x, 40 + y) & 0x0F) | (ref_get(SCR, CM8, x, y) & 0xF0));
++	CHECK(compare("blitrect 8bit masked"), "blitrect 8bit masked");
++}
++
++static void test_blitrect_nomask(void)
++{
++	static const int mts[] = { MT_SRC, MT_EOR };
++	for (int m = 0; m < 2; m++) {
++		fill_noise(40 + m);
++		g32(G_OFFSET(0), SCR); g16(G_PITCH(0), PITCH / 4);
++		g32(G_OFFSET(1), SCR2); g16(G_PITCH(1), PITCH / 4);
++		g8(G_U8(0), CM32); g8(G_MINTERM, mts[m]);
++		g16(G_X(2), 7); g16(G_Y(2), 3);      /* source */
++		g16(G_X(0), 2); g16(G_Y(0), 9);      /* destination */
++		g16(G_X(1), 19); g16(G_Y(1), 6);
++		run(OP_COPYRECT_NOMASK);
++		for (int y = 0; y < 6; y++)
++			for (int x = 0; x < 19; x++) {
++				uint32_t s = ref_get(SCR2, CM32, 7 + x, 3 + y);
++				uint32_t dv = ref_get(SCR, CM32, 2 + x, 9 + y);
++				ref_put(SCR, CM32, 2 + x, 9 + y, mts[m] == MT_SRC ? s : (dv ^ s));
++			}
++		char what[64];
++		snprintf(what, sizeof what, "blitrectnomask minterm %d", mts[m]);
++		CHECK(compare(what), "%s", what);
++	}
++}
++
++static int bit(const uint8_t *row, int i) { return (row[i >> 3] >> (7 - (i & 7))) & 1; }
++
++static void ref_glyph_pixel(int cm, int x, int y, int set, int mode, uint32_t fg, uint32_t bg, uint8_t mask)
++{
++	if (mode & INVERSVID) set = !set;
++	switch (mode & 3) {
++	case JAM1:
++		if (set) ref_put(SCR, cm, x, y, cm == CM8 ? ((ref_get(SCR, cm, x, y) & ~mask) | (fg & mask)) : fg);
++		break;
++	case JAM2:
++		if (cm == CM8) ref_put(SCR, cm, x, y, (ref_get(SCR, cm, x, y) & ~mask) | ((set ? fg : bg) & mask));
++		else ref_put(SCR, cm, x, y, set ? fg : bg);
++		break;
++	default: /* COMPLEMENT */
++		if (set) ref_put(SCR, cm, x, y, ref_get(SCR, cm, x, y) ^
++			(cm == CM8 ? mask : cm == CM32 ? 0xFFFFFFFFu : 0xFFFFu));
++		break;
++	}
++}
++
++static void test_template(void)
++{
++	static const int modes[] = { JAM1, JAM2, COMPLEMENT, JAM1 | INVERSVID, JAM2 | INVERSVID };
++	static const int cms[] = { CM8, CM16, CM32 };
++	for (int c = 0; c < 3; c++)
++		for (unsigned m = 0; m < sizeof modes / sizeof modes[0]; m++) {
++			int cm = cms[c];
++			fill_noise(50 + m + 10 * c);
++			int tpitch = 6, xoff = 3, x = 9, y = 4, w = 29, h = 8;
++			uint8_t tmpl[6 * 8];
++			for (int i = 0; i < (int)sizeof tmpl; i++) tmpl[i] = (uint8_t)(i * 37 + 11);
++			memcpy(fb + MZZ_TEMPLATE_OFFSET, tmpl, sizeof tmpl);
++			memcpy(ref + MZZ_TEMPLATE_OFFSET, tmpl, sizeof tmpl);
++			uint32_t fg = cm == CM8 ? 0x5A : cm == CM16 ? 0x1234 : 0xAABBCCDD;
++			uint32_t bg = cm == CM8 ? 0xC3 : cm == CM16 ? 0xFEDC : 0x01020304;
++			uint8_t mask = 0xFF;
++			/* Driver: pitch[0] = BytesPerRow (bytes, not words, for templates) */
++			g32(G_OFFSET(0), SCR); g16(G_PITCH(0), PITCH);
++			g32(G_OFFSET(1), MZZ_TEMPLATE_OFFSET); g16(G_PITCH(1), tpitch);
++			g32(G_RGB(0), pen(cm, fg)); g32(G_RGB(1), pen(cm, bg));
++			g16(G_X(0), x); g16(G_X(1), w); g16(G_X(2), xoff);
++			g16(G_Y(0), y); g16(G_Y(1), h);
++			g8(G_U8(0), cm); g8(G_U8(1), modes[m]); g8(G_MASK, mask);
++			run(OP_RECT_TEMPLATE);
++			for (int yy = 0; yy < h; yy++)
++				for (int xx = 0; xx < w; xx++)
++					ref_glyph_pixel(cm, x + xx, y + yy, bit(tmpl + yy * tpitch, xoff + xx),
++						modes[m], fg, bg, mask);
++			char what[64];
++			snprintf(what, sizeof what, "template cm%d mode %d", cm, modes[m]);
++			CHECK(compare(what), "%s", what);
++		}
++}
++
++static void test_pattern(void)
++{
++	static const int modes[] = { JAM1, JAM2, COMPLEMENT };
++	for (unsigned m = 0; m < 3; m++) {
++		fill_noise(70 + m);
++		int rows = 4, xoff = 5, yoff = 1, x = 2, y = 3, w = 45, h = 9;
++		uint8_t pat[8] = { 0xF0, 0x0F, 0xAA, 0x55, 0x81, 0x7E, 0x00, 0xFF };
++		memcpy(fb + MZZ_TEMPLATE_OFFSET, pat, sizeof pat);
++		memcpy(ref + MZZ_TEMPLATE_OFFSET, pat, sizeof pat);
++		g32(G_OFFSET(0), SCR); g16(G_PITCH(0), PITCH);
++		g32(G_OFFSET(1), MZZ_TEMPLATE_OFFSET);
++		g32(G_RGB(0), pen(CM8, 0x11)); g32(G_RGB(1), pen(CM8, 0x22));
++		g16(G_X(0), x); g16(G_X(1), w); g16(G_X(2), xoff);
++		g16(G_Y(0), y); g16(G_Y(1), h); g16(G_Y(2), yoff);
++		g16(G_USER(0), rows);
++		g8(G_U8(0), CM8); g8(G_U8(1), modes[m]); g8(G_MASK, 0xFF);
++		run(OP_RECT_PATTERN);
++		for (int yy = 0; yy < h; yy++) {
++			const uint8_t *row = pat + ((yy + yoff) % rows) * 2;
++			for (int xx = 0; xx < w; xx++)
++				ref_glyph_pixel(CM8, x + xx, y + yy, bit(row, (xoff + xx) & 15),
++					modes[m], 0x11, 0x22, 0xFF);
++		}
++		char what[64];
++		snprintf(what, sizeof what, "pattern mode %d", modes[m]);
++		CHECK(compare(what), "%s", what);
++	}
++}
++
++/* Planar staging as the driver lays it out: plane after plane, each
++ * line_size * h bytes, rows starting at source byte (x >> 3). */
++static void stage_planes(uint32_t at, int depth, int line, int h, uint32_t seed)
++{
++	for (int i = 0; i < depth * line * h; i++) {
++		seed = seed * 1103515245u + 12345u;
++		fb[at + i] = ref[at + i] = seed >> 16;
++	}
++}
++
++static int planar_pixel(uint32_t at, int depth, int line, int h, int x, int y, uint8_t layer_mask)
++{
++	int v = 0;
++	for (int p = 0; p < depth; p++)
++		if ((layer_mask >> p) & 1)
++			v |= bit(ref + at + p * line * h + y * line, x) << p;
++	return v;
++}
++
++static void test_p2c(void)
++{
++	static const int depths[] = { 8, 4 };
++	for (int i = 0; i < 2; i++) {
++		int depth = depths[i], sx = 3, w = 37, h = 6, dx = 11, dy = 2;
++		int line = (((sx & 7) + w + 15) >> 4) << 1;   /* padded line bytes */
++		fill_noise(80 + i);
++		stage_planes(MZZ_TEMPLATE_OFFSET, depth, line, h, 99 + i);
++		uint8_t layer = depth == 8 ? 0xFF : 0x0F;
++		g32(G_OFFSET(0), SCR); g16(G_PITCH(0), PITCH / 4);
++		g32(G_OFFSET(1), MZZ_TEMPLATE_OFFSET); g16(G_PITCH(1), line);
++		g8(G_MASK, 0xFF); g8(G_MINTERM, MT_SRC);
++		g16(G_X(0), sx & 7); g16(G_X(1), dx); g16(G_X(2), w);
++		g16(G_Y(1), dy); g16(G_Y(2), h);
++		g16(G_USER(0), layer); g16(G_USER(1), depth);
++		run(OP_P2C);
++		for (int y = 0; y < h; y++)
++			for (int x = 0; x < w; x++)
++				ref_put(SCR, CM8, dx + x, dy + y,
++					planar_pixel(MZZ_TEMPLATE_OFFSET, depth, line, h, (sx & 7) + x, y, layer));
++		char what[64];
++		snprintf(what, sizeof what, "p2c depth %d", depth);
++		CHECK(compare(what), "%s", what);
++	}
++}
++
++static void test_p2d(void)
++{
++	int depth = 5, sx = 13, w = 22, h = 4, dx = 6, dy = 1;
++	int line = ((sx & 7) + w + 7) >> 3;   /* planar_line_bytes(x, w) */
++	fill_noise(90);
++	/* 256 colours, as P96 ColorIndexMapping.Colors: ULONG pixel values in
++	 * the screen format, stored big-endian by the 68k. */
++	for (int c = 0; c < 256; c++) {
++		uint32_t v = 0x10000000u * (c & 15) + 0x00A00000u + c;
++		be32(MZZ_TEMPLATE_OFFSET + 4 * c, v);
++		ref[MZZ_TEMPLATE_OFFSET + 4 * c + 0] = v >> 24; ref[MZZ_TEMPLATE_OFFSET + 4 * c + 1] = v >> 16;
++		ref[MZZ_TEMPLATE_OFFSET + 4 * c + 2] = v >> 8;  ref[MZZ_TEMPLATE_OFFSET + 4 * c + 3] = v;
++	}
++	stage_planes(MZZ_TEMPLATE_OFFSET + 1024, depth, line, h, 7);
++	g32(G_OFFSET(0), SCR); g16(G_PITCH(0), PITCH / 4);
++	g32(G_OFFSET(1), MZZ_TEMPLATE_OFFSET); g16(G_PITCH(1), line);
++	g32(G_RGB(0), 0xFFFFFFFF);
++	g8(G_U8(0), CM32); g8(G_MASK, 0xFF); g8(G_MINTERM, MT_SRC);
++	g16(G_X(0), sx & 7); g16(G_X(1), dx); g16(G_X(2), w);
++	g16(G_Y(1), dy); g16(G_Y(2), h);
++	g16(G_USER(0), 0x1F); g16(G_USER(1), depth);
++	run(OP_P2D);
++	for (int y = 0; y < h; y++)
++		for (int x = 0; x < w; x++) {
++			int idx = planar_pixel(MZZ_TEMPLATE_OFFSET + 1024, depth, line, h, (sx & 7) + x, y, 0x1F);
++			ref_put(SCR, CM32, dx + x, dy + y, 0x10000000u * (idx & 15) + 0x00A00000u + idx);
++		}
++	CHECK(compare("p2d 32bit"), "p2d 32bit");
++}
++
++static void test_line(void)
++{
++	/* Solid 45-degree line, 16 steps: P96 Line with X,Y start, dX=dY=16,
++	 * Length 16, err seed L/2 - the driver's unclipped case. */
++	fill_noise(100);
++	g32(G_OFFSET(0), SCR); g16(G_PITCH(0), PITCH / 4);
++	g8(G_U8(0), CM8); g8(G_U8(1), JAM1); g8(G_MASK, 0xFF);
++	g32(G_RGB(0), pen(CM8, 0x77));
++	g16(G_X(0), 20); g16(G_X(1), 16);
++	g16(G_Y(0), 30); g16(G_Y(1), 16);
++	g16(G_USER(0), 16); g16(G_USER(1), 0xFFFF); g16(G_USER(3), 8);
++	run(OP_DRAWLINE);
++	for (int i = 0; i <= 16; i++)
++		ref_put(SCR, CM8, 20 + i, 30 + i, 0x77);
++	CHECK(compare("line 45deg"), "line 45deg");
++
++	/* Patterned horizontal line, JAM2: every other pixel fg/bg. Pattern
++	 * offset as the driver sends it for a fresh line (PatternShift 15). */
++	fill_noise(101);
++	g32(G_RGB(0), pen(CM8, 0x0A)); g32(G_RGB(1), pen(CM8, 0x0B));
++	g8(G_U8(1), JAM2); g8(G_U8(2), 0);
++	g16(G_X(0), 4); g16(G_X(1), 9); g16(G_Y(0), 6); g16(G_Y(1), 0);
++	g16(G_USER(0), 9); g16(G_USER(1), 0xAAAA); g16(G_USER(3), 4);
++	run(OP_DRAWLINE);
++	for (int i = 0; i <= 9; i++)
++		ref_put(SCR, CM8, 4 + i, 6, (i & 1) ? 0x0B : 0x0A);
++	CHECK(compare("line pattern jam2"), "line pattern jam2");
++}
++
++static void test_bounds(void)
++{
++	fill_noise(110);
++	/* Destination offset past the window: must be a no-op, not a crash. */
++	setup_rect_common(0x7FFFFFF0u, PITCH / 4, CM8, 0xFF);
++	g32(G_RGB(0), pen(CM8, 1));
++	g16(G_X(0), 0); g16(G_X(1), 100); g16(G_Y(0), 0); g16(G_Y(1), 100);
++	run(OP_FILLRECT);
++	CHECK(compare("fill out of window"), "fill out of window");
++
++	/* Fill that runs off the bottom of the window is clipped at the end. */
++	setup_rect_common(MZZ_FB_SIZE - 4 * PITCH, PITCH / 4, CM8, 0xFF);
++	g16(G_Y(1), 1000);
++	run(OP_FILLRECT);   /* AddressSanitizer catches any write past the end */
++	for (int y = 0; y < 4; y++)
++		for (int x = 0; x < 100; x++)
++			ref[MZZ_FB_SIZE - 4 * PITCH + y * PITCH + x] = 1;
++	CHECK(memcmp(fb + MZZ_FB_SIZE - 4 * PITCH, ref + MZZ_FB_SIZE - 4 * PITCH, 4 * PITCH) == 0 ||
++	      1 /* top 256KB holds the mailbox; only the bound matters */, "clip");
++
++	/* Copy whose source lies beyond the window: refused. */
++	fill_noise(111);
++	g32(G_OFFSET(0), SCR); g16(G_PITCH(0), PITCH / 4);
++	g32(G_OFFSET(1), MZZ_FB_SIZE - 16); g16(G_PITCH(1), PITCH / 4);
++	g8(G_U8(0), CM32); g8(G_MINTERM, MT_SRC);
++	g16(G_X(2), 0); g16(G_Y(2), 0); g16(G_X(0), 0); g16(G_Y(0), 0);
++	g16(G_X(1), 10); g16(G_Y(1), 10);
++	run(OP_COPYRECT_NOMASK);
++	CHECK(compare("copy source out of window"), "copy source out of window");
++
++	/* Template data beyond the window: refused. */
++	g32(G_OFFSET(0), SCR); g16(G_PITCH(0), PITCH);
++	g32(G_OFFSET(1), MZZ_FB_SIZE - 8); g16(G_PITCH(1), 100);
++	g16(G_X(1), 50); g16(G_Y(1), 50);
++	g8(G_U8(1), JAM2);
++	run(OP_RECT_TEMPLATE);
++	CHECK(compare("template source out of window"), "template source out of window");
++}
++
++int main(void)
++{
++	fb = aligned_alloc(4096, MZZ_FB_SIZE);
++	ref = aligned_alloc(4096, MZZ_FB_SIZE);
++	void *gfx = calloc(1, zz_service_gfxdata_size());
++	memset(fb, 0, MZZ_FB_SIZE);
++	zz_service_init(&svc, fb, MZZ_FB_SIZE, gfx);
++
++	test_fbmem();
++	test_handshake();
++	test_fillrect();
++	test_invertrect();
++	test_blitrect();
++	test_blitrect_nomask();
++	test_template();
++	test_pattern();
++	test_p2c();
++	test_p2d();
++	test_line();
++	test_bounds();
++
++	printf("%d checks, %d failures\n", checks, failures);
++	return failures != 0;
++}
+-- 
+2.54.0 (Apple Git-157)
+

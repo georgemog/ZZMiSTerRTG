@@ -1,0 +1,7 @@
+MiSTerZZTest: mode $50001000 640x480, MiSTer, depth 8, ARM attached
+scene: 83 ARM ops, 0 rejected, 0 of 64000 pixels differ -> PASS
+  RectFill 64x64                 2000 in  0.606s =   3299.9/s  (ARM ops 2000)
+  RectFill 320x200                300 in  0.374s =    801.1/s  (ARM ops 300)
+  ScrollRaster 320x200 by 1       300 in  0.897s =    334.4/s  (ARM ops 600)
+  Text 40 chars JAM2             1000 in  1.030s =    970.4/s  (ARM ops 1000)
+  Draw line ~200px               3000 in  0.844s =   3555.5/s  (ARM ops 3000)

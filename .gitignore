@@ -1,0 +1,5 @@
+amiga/build/
+amiga/sdk/
+tests/host/zz9000_host_test
+*.dSYM/
+.DS_Store

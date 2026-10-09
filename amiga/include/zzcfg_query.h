@@ -1,0 +1,131 @@
+/*
+ * Header-only ZZ9000.CFG value query (firmware ABI >= 2.3, issue #33).
+ * Copyright (C) 2026, Dimitris Panokostas <midwan@gmail.com>
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Self-contained so device drivers (net/ahi/mhi) can consult the
+ * SD-card config without linking the full common/zzcfg_amiga.c client
+ * or pulling in proto headers. On firmware older than 2.3 the register
+ * group reads as zero, so every key reports "absent" and callers fall
+ * back to their ENV: variables - no version check needed.
+ */
+#ifndef ZZCFG_QUERY_H
+#define ZZCFG_QUERY_H
+
+#include <exec/types.h>
+
+#ifndef ZZ_REG_CONFIG_KEY
+#define ZZ_REG_CONFIG_KEY        0xE8
+#define ZZ_REG_CONFIG_PRESENT    0xEA
+#define ZZ_REG_CONFIG_FILE       0xEC
+#define ZZ_REG_CONFIG_FILE_LEN   0xEE
+#endif
+
+/* Key ids (mirror firmware zz_config.h). */
+#define ZZ_CFG_KEY_LOADED          0
+#define ZZ_CFG_KEY_VIDEOCAP_MODE   1
+#define ZZ_CFG_KEY_NS_VSYNC        2
+#define ZZ_CFG_KEY_SCANLINE_MODE   3
+#define ZZ_CFG_KEY_SCANLINE_PARITY 4
+#define ZZ_CFG_KEY_INT2            5
+#define ZZ_CFG_KEY_MAC_HI          6
+#define ZZ_CFG_KEY_MAC_MID         7
+#define ZZ_CFG_KEY_MAC_LO          8
+#define ZZ_CFG_KEY_OFFSCREEN_BITMAPS 9
+#define ZZ_CFG_KEY_YUV_RECT          10
+#define ZZ_CFG_KEY_VIDEO_OVERLAY     11
+#define ZZ_CFG_KEY_VIDEOCAP_SAMPLE   12
+#define ZZ_CFG_KEY_VIDEOCAP_SHRES    13
+#define ZZ_CFG_KEY_VIDEOCAP_CROP_H   14
+#define ZZ_CFG_KEY_VIDEOCAP_CROP_V   15
+/* 1 when the loaded file exceeded the 4 KiB parse budget, so trailing
+ * keys (the audio block serializes last) were ignored. */
+#define ZZ_CFG_KEY_AUDIO_TRUNCATED   16
+#define ZZ_CFG_KEY_VIDEOCAP_PHASE    17 /* signed E7M phase, -255..255 */
+#define ZZ_CFG_KEY_VIDEOCAP_C28_PHASE 18 /* signed C28 phase, -896..895 */
+#define ZZ_CFG_KEY_FAST_RAM          19
+#define ZZ_CFG_KEY_FAST_RAM_OUTCOME  20
+/* Runtime RTG VDMA geometry diagnostics: live video state, not config
+ * file values. LINE/STRIDE/PAN are the raw 16-bit values; INFO packs
+ * [15:13] hdiv, [12:11] stride_div, [10:0] hsize; MODESEL packs
+ * [15:10] colormode, [9:8] scalemode, [7:0] mode id. */
+#define ZZ_CFG_KEY_RTG_GEOM_LINE     21
+#define ZZ_CFG_KEY_RTG_GEOM_STRIDE   22
+#define ZZ_CFG_KEY_RTG_GEOM_PAN      23
+#define ZZ_CFG_KEY_RTG_GEOM_INFO     24
+#define ZZ_CFG_KEY_RTG_GEOM_MODESEL  25
+#define ZZ_CONFIG_KEY_VIDEOCAP_WIDTH  26
+#define ZZ_CONFIG_KEY_VIDEOCAP_HEIGHT 27
+#define ZZ_CFG_KEY_VIDEOCAP_WIDTH     ZZ_CONFIG_KEY_VIDEOCAP_WIDTH
+#define ZZ_CFG_KEY_VIDEOCAP_HEIGHT    ZZ_CONFIG_KEY_VIDEOCAP_HEIGHT
+/* Native-capture geometry transaction state. Values are runtime state, not
+ * persisted CFG entries; serials identify the request that a vblank applied. */
+#define ZZ_CFG_KEY_VCAP_GEOMETRY_REQUEST_WIDTH  28
+#define ZZ_CFG_KEY_VCAP_GEOMETRY_REQUEST_HEIGHT 29
+#define ZZ_CFG_KEY_VCAP_GEOMETRY_APPLIED_WIDTH  30
+#define ZZ_CFG_KEY_VCAP_GEOMETRY_APPLIED_HEIGHT 31
+#define ZZ_CFG_KEY_VCAP_GEOMETRY_REQUEST_SERIAL 32
+#define ZZ_CFG_KEY_VCAP_GEOMETRY_APPLIED_SERIAL 33
+#define ZZ_CFG_KEY_VCAP_GEOMETRY_STATUS         34
+#define ZZ_CFG_VCAP_GEOMETRY_STATUS_APPLIED_VALID 1U
+#define ZZ_CFG_VCAP_GEOMETRY_STATUS_PENDING       2U
+#define ZZ_CFG_VCAP_GEOMETRY_STATUS_REJECTED      4U
+
+/* ZZ_CFG_KEY_FAST_RAM_OUTCOME values (mirror firmware zz_fastram_outcome). */
+#define ZZ_CFG_FAST_RAM_OUTCOME_PENDING   0
+#define ZZ_CFG_FAST_RAM_OUTCOME_ENABLED   1
+#define ZZ_CFG_FAST_RAM_OUTCOME_OFF       2
+#define ZZ_CFG_FAST_RAM_OUTCOME_ABSENT    3
+#define ZZ_CFG_FAST_RAM_OUTCOME_INVALID   4
+#define ZZ_CFG_FAST_RAM_OUTCOME_TRUNCATED 5
+#define ZZ_CFG_FAST_RAM_OUTCOME_MEDIA_ERR 6
+#define ZZ_CFG_FAST_RAM_OUTCOME_TIMEOUT   7
+#define ZZ_CFG_FAST_RAM_OUTCOME_BAK_ON    8
+
+/* ZZ_REG_CONFIG_FILE statuses (mirror firmware zz_config_file_status). */
+#define ZZ_CFG_FILE_OK           0
+#define ZZ_CFG_FILE_NO_FILE      1
+#define ZZ_CFG_FILE_IO_ERROR     2
+#define ZZ_CFG_FILE_IDLE         0xFFFF
+
+/* enum zz_video_modes values the config interface deals in. */
+#define ZZ_VMODE_800x600         1
+#define ZZ_VMODE_CENTERED_1080P_60 5
+#define ZZ_VMODE_CENTERED_1080P_50 7
+#define ZZ_VMODE_720x576         6
+/* Virtual id for the centered source-sync capture profile: never a
+ * preset_video_modes row. Only firmware advertising all three
+ * ZZ_FW_CAP_VIDEOCAP_CENTERED_1080P/_50/_SOURCE_SYNC bits understands
+ * it; older firmware never reports it, and the driver-side sanitize
+ * maps it away on mixed stacks. */
+#define ZZ_VMODE_CENTERED_1080P_MATCH 0x100
+/* Query one parsed ZZ9000.CFG value. *present is set to 1 if the key
+ * was given in the config file (for ZZ_CFG_KEY_LOADED: whether the
+ * file was found at cold boot); the value reads as 0 when absent. */
+#ifdef ZZCFG_TEST_IO
+extern UWORD zzcfg_test_reg_read(ULONG board, ULONG offset);
+extern void zzcfg_test_reg_write(ULONG board, ULONG offset, UWORD value);
+#define ZZCFG_REG_READ(board, offset) \
+    zzcfg_test_reg_read((board), (offset))
+#define ZZCFG_REG_WRITE(board, offset, value) \
+    zzcfg_test_reg_write((board), (offset), (value))
+#else
+#define ZZCFG_REG_READ(board, offset) \
+    (*(volatile UWORD *)((board) + (offset)))
+#define ZZCFG_REG_WRITE(board, offset, value) \
+    (*(volatile UWORD *)((board) + (offset)) = (value))
+#endif
+
+static inline UWORD zzcfg_query(ULONG board, UWORD key, UWORD *present)
+{
+    UWORD value, p;
+
+    ZZCFG_REG_WRITE(board, ZZ_REG_CONFIG_KEY, key);
+    value = ZZCFG_REG_READ(board, ZZ_REG_CONFIG_KEY);
+    p = ZZCFG_REG_READ(board, ZZ_REG_CONFIG_PRESENT);
+
+    if (present) *present = p;
+    return value;
+}
+
+#endif /* ZZCFG_QUERY_H */

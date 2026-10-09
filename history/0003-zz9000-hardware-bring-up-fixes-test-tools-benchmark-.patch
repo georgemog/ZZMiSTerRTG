@@ -1,0 +1,1035 @@
+From 31212d85eb65236f1236507fbf41c7542d4606b5 Mon Sep 17 00:00:00 2001
+From: Nigel Shearman <georgemog@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 12:18:04 +0100
+Subject: [PATCH 3/3] zz9000: hardware bring-up fixes, test tools, benchmark
+ results
+
+Brought up on the MiSTer with the A4091+RTG+A2065 v2 core; all three
+depths now pass a pixel-exact comparison against the native blitter.
+
+Fixes found on hardware:
+- exec CacheClearU() does not flush the FPGA CPU cache: cpu_cache_new
+  clears on a 0->1 edge of CACR bit 3 and the TG68 latches it, so only
+  the first call after a CacheControl() clears. The first kick read a
+  stale DONE, timed out and disabled acceleration. New
+  mister_fpga_cache_clear() toggles CI 0->1 in supervisor mode with chip
+  reads in between so the controller samples both levels.
+- service thread inherited MiSTer's CPU1 affinity and fought the busy
+  main loop (flat ~0.5ms/op); pin it to CPU0 -> ~1.75x throughput.
+- P96 board name back to "MiSTer" so Picasso96Settings modes carry over.
+- protocol v2: DONE ring on separate cache lines, one flush per op.
+
+Added MiSTerZZTest (accelerated scene vs planar reference + benchmark),
+SetToolType (set BOARDTYPE from the CLI), driver diagnostics in spare
+mailbox words, shown by MiSTerZZInfo.
+
+Benchmarks vs software MiSTer.card: big fills 4-6x, scrolls 3-4x, text
+1.5-1.8x, small fills 1.5-3x, short lines ~0.85x.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ zz9000/README.md                     | 111 ++++++---
+ zz9000/amiga/Makefile                |  12 +-
+ zz9000/amiga/rtg/mntgfx-gcc.c        |  53 ++++-
+ zz9000/amiga/tools/MiSTerZZInfo.c    |  11 +-
+ zz9000/amiga/tools/MiSTerZZTest.c    | 342 +++++++++++++++++++++++++++
+ zz9000/amiga/tools/SetToolType.c     |  71 ++++++
+ zz9000/common/mister_zz9000.h        |  30 ++-
+ zz9000/common/mister_zz9000_cache.h  |  45 ++++
+ zz9000/mister/minimig_zz9000.cpp     |  12 +
+ zz9000/mister/zz9000_service.c       |   6 +
+ zz9000/tests/host/zz9000_host_test.c |   6 +
+ 11 files changed, 647 insertions(+), 52 deletions(-)
+ create mode 100644 zz9000/amiga/tools/MiSTerZZTest.c
+ create mode 100644 zz9000/amiga/tools/SetToolType.c
+ create mode 100644 zz9000/common/mister_zz9000_cache.h
+
+diff --git a/zz9000/README.md b/zz9000/README.md
+index e7d3665e..fca855ae 100644
+--- a/zz9000/README.md
++++ b/zz9000/README.md
+@@ -30,7 +30,10 @@ the RTG framebuffer in DDR3.
+ |------|------|
+ | `amiga/rtg/` | Official ZZ9000 driver (`mntgfx-gcc.c` …), adapted → `MiSTerZZ.card` |
+ | `amiga/include/` | Official ZZ9000 driver headers, unchanged |
+-| `amiga/tools/MiSTerZZInfo.c` | Read-only status tool for bring-up |
++| `amiga/tools/MiSTerZZInfo.c` | Read-only status tool: board, scanout regs, mailbox, driver diagnostics |
++| `amiga/tools/MiSTerZZTest.c` | Hardware test: accelerated scene vs native-blitter reference, plus benchmark |
++| `amiga/tools/SetToolType.c` | CLI tooltype editor (to set `BOARDTYPE` on a monitor icon) |
++| `common/mister_zz9000_cache.h` | FPGA CPU cache flush that actually works on the TG68 (see design notes) |
+ | `mister/zz9000os/` | Official ZZ9000OS `gfx.c`/`gfx.h`/`zz_video_modes.h` (unchanged), `dma_rtg.c` (adapted), `video.h` (shim) |
+ | `mister/zz9000_*.c` | MiSTer service: mailbox, build wrapper, framebuffer-safe memcpy |
+ | `mister/minimig_zz9000.cpp` | Thread + `/dev/mem` mapping, for `Main_MiSTer/support/minimig/` |
+@@ -57,7 +60,7 @@ Amiga side (build server, bebbo GCC 6.5):
+ cd zz9000/amiga
+ export PATH=/opt/amiga/bin:$PATH
+ make p96-sdk        # once: Picasso96 developer headers into sdk/
+-make                # build/MiSTerZZ.card, build/MiSTerZZInfo
++make                # build/MiSTerZZ.card + MiSTerZZInfo, MiSTerZZTest, SetToolType
+ ```
+ 
+ MiSTer side:
+@@ -78,18 +81,24 @@ make -C zz9000/tests/host
+ 
+ ## Install
+ 
+-1. MiSTer: `killall MiSTer`, copy the new binary to `/media/fat/MiSTer`, then
+-   `reboot` (inittab starts MiSTer via sysinit, not respawn; a running binary
+-   cannot be overwritten). The log shows `ZZ9000: RTG blitter service started`
+-   when the Minimig core loads and `ZZ9000: driver attached` once the Amiga
+-   driver has initialised.
++1. MiSTer: install the new binary where the Minimig core will run it. Either
++   replace `/media/fat/MiSTer` (`killall MiSTer`, copy, `reboot`; inittab
++   starts it via sysinit and a running binary cannot be overwritten), or, if
++   `MiSTer.ini [minimig]` has `main=<binary>`, replace that file while a
++   non-Minimig core is loaded, then load the Minimig core. Its stdout goes to
++   `/dev/console`; `MiSTerZZInfo` (step 3) is the practical way to see it.
+ 2. Amiga: copy `MiSTerZZ.card` to `LIBS:Picasso96/`. Duplicate the existing
+-   MiSTer monitor icon in `DEVS:Monitors`, set its tooltype
+-   `BOARDTYPE=MiSTerZZ`, and move the old `MiSTer` monitor out of
+-   `DEVS:Monitors` (both drivers claim the same board; whichever runs first
+-   wins).
++   MiSTer monitor in `DEVS:Monitors` (`MiSTer` → `MiSTerZZ`, with its
++   `.info`), set `BOARDTYPE=MiSTerZZ` on the copy
++   (`SetToolType DEVS:Monitors/MiSTerZZ BOARDTYPE=MiSTerZZ`), and move the
++   old `MiSTer` monitor to `SYS:Storage/Monitors` (both drivers claim the same
++   board; whichever runs first wins). In Picasso96Mode the board still
++   appears as **"MiSTer"** (type 10), deliberately: `Picasso96Settings` keys
++   screen modes on that name, so the existing MiSTer modes carry over.
+ 3. Reboot the Amiga, then run `MiSTerZZInfo`. Expect
+-   `=> ARM blitter attached and running`.
++   `driver state $7 (attached initcard BIF_BLITTER)` and
++   `=> ARM blitter attached and running`. `MiSTerZZTest DEPTH 8|16|32`
++   should end in `PASS`.
+ 
+ If the MiSTer binary has no ZZ9000 support, the driver waits about a second at
+ boot, prints nothing on screen, and runs as a plain unaccelerated framebuffer
+@@ -125,11 +134,23 @@ writes `OP`, increments `KICK`, and spins until the ARM writes `DONE`. One
+ assumptions stay valid, and `WaitBlitter()` has nothing to do.
+ 
+ **FPGA cache coherency.** `cpu_cache_new` in `ddram_ctrl` caches CPU reads of
+-the RTG window. The ARM writes behind its back, so the driver calls
+-`CacheClearU()` before every mailbox read and once more after `DONE`. On the
+-TG68 this pulses CACR bit 3, which clears the whole FPGA cache (instruction and
+-data). This is the main cost of an op. If you inhibit caching for `sel_rtg` in
+-`cpu_wrapper.v`, you can drop it (see below).
++the RTG window. The ARM writes behind its back, so the driver flushes that
++cache before every mailbox read and once more after `DONE`.
++`CacheClearU()` does **not** work for this, which was found on hardware. The
++cache clears on a 0→1 edge of CACR bit 3, the TG68 latches that bit, and exec
++always writes it as 1, so only the first `CacheClearU()` after a
++`CacheControl()` clears anything. The first kick then read a stale `DONE`,
++timed out, and the driver dropped to software. `mister_fpga_cache_clear()`
++(`common/mister_zz9000_cache.h`) writes CI=0 then CI=1 in supervisor mode,
++with chip-register reads in between so the controller samples both levels.
++The whole FPGA cache (instruction and data) is flushed every time, and this
++is the main per-op cost. Inhibiting the cache for `sel_rtg` in
++`cpu_wrapper.v` would remove the need for it (see below).
++
++**Diagnostics.** The driver writes its init state and counts of hook calls,
++fallbacks and the last format into spare mailbox words (`MZZ_MB_DRV_*`).
++`MiSTerZZInfo` prints them, and Linux can read them with
++`devmem 0x277C0080`.
+ 
+ **Strongly-ordered memory.** The framebuffer lies outside Linux RAM, so
+ `/dev/mem` maps it uncached and Strongly-ordered. ARMv7 faults every unaligned
+@@ -153,27 +174,57 @@ clamped by upstream's `fb_limit`. The ARM writes nothing in the window until
+ a driver has published `REQ_MAGIC`. It clears a stale `REQ_MAGIC` when the
+ core loads.
+ 
+-**Polling.** The thread spins (`sched_yield`) for 5ms after each op, sleeps
+-200µs when the driver is attached but idle, and sleeps 20ms when no driver is
+-attached. The driver's attach timeout covers the 20ms sleep.
++**Polling.** The thread runs on CPU0, away from MiSTer's main loop on CPU1.
++It spins for 5ms after each op, sleeps 200µs when the driver is attached but
++idle, and sleeps 20ms when no driver is attached. The driver's attach timeout
++covers the 20ms sleep. On the 68k side, `DONE` is also written into a ring
++of 64 words on separate FPGA cache lines (protocol v2). Each poll reads a
++fresh line, so the driver flushes only once per op plus once per ring wrap.
+ 
+ ## Status
+ 
+-- Host test: 241 checks pass under ASan/UBSan. They cover the handshake,
+-  byte-swapped refusal, every op in 8/16/32-bit with masks, overlapping
+-  copies in all directions, minterms, template/pattern draw modes, P2C/P2D,
+-  lines, and out-of-window rejection.
+-- `MiSTerZZ.card` (25.9KB) and `MiSTerZZInfo` build with bebbo GCC 6.5. A full
+-  `MiSTer` binary builds with the module, with 0 warnings from it.
+-- **Not yet run on hardware.** Bring-up checks: the attach message in the
+-  MiSTer log, `MiSTerZZInfo` output, P96 test screen and window dragging in
+-  each format, text rendering, and the `ops` counter climbing.
++**Working on hardware (2026-10-09).** Tested with
++`minimig_20260906_A4091_RTG_A2065_v2.rbf` (68020, Z3 RTG board at
++`$50000000`), Picasso96 rtg.library 43.538, and the MiSTer binary built from
++the live A4091/A2091 tree plus this module.
++
++- `MiSTerZZTest DEPTH 8/16/32`: **PASS** at every depth. The ~80 accelerated
++  ops of the test scene (fills, invert, JAM1/JAM2/INVERSVID/COMPLEMENT text,
++  solid and patterned lines, area patterns, overlapping scrolls in four
++  directions, copy and XOR minterm blits, 8- and 5-plane planar blits) all
++  ran on the ARM, and the result is 0 of 64000 pixels different from the
++  same scene drawn on a planar bitmap by the native Amiga blitter.
++- Host test: 242 checks pass under ASan/UBSan.
++
++Benchmark (`MiSTerZZTest BENCH`, 640x480 screen, ops/s), MiSTerZZ.card vs the
++previous software-only MiSTer.card:
++
++| primitive | 8-bit ZZ | 8-bit sw | | 32-bit ZZ | 32-bit sw | |
++|---|---:|---:|---:|---:|---:|---:|
++| RectFill 64x64 | 3300 | 2211 | 1.5x | 2255 | 714 | 3.2x |
++| RectFill 320x200 | 801 | 185 | 4.3x | 306 | 47 | 6.5x |
++| ScrollRaster 320x200 | 334 | 98 | 3.4x | 109 | 26 | 4.2x |
++| Text 40 chars JAM2 | 970 | 671 | 1.45x | 978 | 553 | 1.8x |
++| Line ~200px | 3555 | 3934 | 0.9x | 3293 | 3933 | 0.84x |
++
++Each op has a fixed cost of about 0.28ms: the synchronous mailbox
++round-trip, the FPGA cache flush, and a cold 68k cache afterwards. Short lines
++are therefore slightly slower than drawing them on the CPU, and everything
++with area is faster.
++
++Found during bring-up (all fixed): exec `CacheClearU()` does not flush the
++FPGA cache (see design notes). The service thread must not share CPU1 with
++MiSTer's busy main loop (it is pinned to CPU0, which nearly doubled op
++throughput). The P96 board name must stay "MiSTer" to keep the existing
++screen modes.
+ 
+ ## Possible next steps
+ 
+ - RTL: drop `sel_rtg` from the CPU cache (feed `cache_inhibit`, but not
+-  `ddr_swap`, from it). Then the driver can lose its `CacheClearU()` calls,
++  `ddr_swap`, from it). Then the driver can lose its FPGA cache flushes,
+   and ops become much cheaper for the 68k.
++- Send short lines and tiny fills to the P96 software routine, as upstream
++  already does for its Zorro II path.
+ - Queue several ops per kick, for asynchronous blits. This needs `WaitBlitter`
+   to wait for real, and per-slot GFXData.
+ - Use a cached ARM mapping (kernel helper, or `u-dma-buf`-style reserved
+diff --git a/zz9000/amiga/Makefile b/zz9000/amiga/Makefile
+index 2e1e9977..045cbe1d 100644
+--- a/zz9000/amiga/Makefile
++++ b/zz9000/amiga/Makefile
+@@ -2,7 +2,7 @@
+ #
+ #   export PATH=/opt/amiga/bin:$PATH
+ #   make p96-sdk      # once: fetch the Picasso96 developer headers into sdk/
+-#   make              # -> build/MiSTerZZ.card, build/MiSTerZZInfo
++#   make              # -> build/MiSTerZZ.card + tools (MiSTerZZInfo, MiSTerZZTest, SetToolType)
+ #
+ # Same compiler flags as the official rtg/build.sh.
+ 
+@@ -14,7 +14,7 @@ CFLAGS   := -m68020 -mtune=68020-60 -O2 -Iinclude -I$(P96_INC) -noixemul \
+ SRC      := rtg/mntgfx-gcc.c
+ DEPS     := $(wildcard rtg/*.h include/*.h) ../common/mister_zz9000.h
+ 
+-all: build/MiSTerZZ.card build/MiSTerZZInfo
++all: build/MiSTerZZ.card build/MiSTerZZInfo build/SetToolType build/MiSTerZZTest
+ 
+ build/MiSTerZZ.card: $(SRC) $(DEPS)
+ 	@test -f $(P96_INC)/libraries/Picasso96.h || { echo "Picasso96 headers missing: run 'make p96-sdk' or set P96_INC"; exit 1; }
+@@ -25,6 +25,14 @@ build/MiSTerZZInfo: tools/MiSTerZZInfo.c ../common/mister_zz9000.h
+ 	@mkdir -p build
+ 	$(CC) -m68020 -O2 -noixemul -Wall -o $@ $<
+ 
++build/SetToolType: tools/SetToolType.c
++	@mkdir -p build
++	$(CC) -m68020 -O2 -noixemul -Wall -o $@ $<
++
++build/MiSTerZZTest: tools/MiSTerZZTest.c ../common/mister_zz9000.h
++	@mkdir -p build
++	$(CC) -m68020 -O2 -noixemul -Wall -I$(P96_INC) -o $@ $< -lm
++
+ p96-sdk:
+ 	mkdir -p sdk
+ 	cd sdk && { test -f Develop.lha || wget -q $(P96_URL) -O Develop.lha; } && lha xq Develop.lha
+diff --git a/zz9000/amiga/rtg/mntgfx-gcc.c b/zz9000/amiga/rtg/mntgfx-gcc.c
+index 23559e8b..644e9d3d 100644
+--- a/zz9000/amiga/rtg/mntgfx-gcc.c
++++ b/zz9000/amiga/rtg/mntgfx-gcc.c
+@@ -54,6 +54,7 @@
+ #include "zz9000_hw.h"
+ #include "videocap_mode.h"
+ #include "../../common/mister_zz9000.h"
++#include "../../common/mister_zz9000_cache.h"
+ #include <clib/Picasso96_protos.h>
+ #include <inline/Picasso96.h>
+ 
+@@ -251,8 +252,8 @@ static const UWORD mister_format[] = {
+ 	6 + 32, 6 + 16, 4, 4 + 8, 4, 4 + 8 + 16,
+ };
+ 
+-/* ARM-side blitter timeouts, in mailbox polls (each poll is a CacheClearU()
+- * plus a Zorro III read, so at least ~2us). Attach waits for the MiSTer
++/* ARM-side blitter timeouts, in DONE-ring polls (one Zorro III read each,
++ * plus an FPGA cache flush every MZZ_DONE_RING_SLOTS polls). Attach waits for the MiSTer
+  * thread's 20ms no-driver sleep; an op waits long only once the ARM has
+  * taken it (a full-screen 32-bit copy through /dev/mem is tens of ms). */
+ #define MISTER_ATTACH_POLLS   400000UL
+@@ -276,7 +277,7 @@ static inline BOOL mister_accel(struct BoardInfo *b) {
+ static inline ULONG mister_mbox_read(struct BoardInfo *b, ULONG field) {
+ 	/* The FPGA CPU cache holds RTG window lines: drop them before every
+ 	 * read of a word the ARM writes. */
+-	CacheClearU();
++	mister_fpga_cache_clear();
+ 	return *mister_mbox_field(b, field);
+ }
+ 
+@@ -291,16 +292,25 @@ static void mister_kick(struct BoardInfo *b, UWORD op) {
+ 	if (!mister_accel(b))
+ 		return;
+ 
++	volatile UBYTE *ring = (volatile UBYTE *)b->MemoryBase + MZZ_DONE_RING_OFFSET;
++	ULONG slot = 0;
++
+ 	seq = ++mister_seq;
+ 	*mister_mbox_field(b, MZZ_MB_OP) = op;
+ 	*mister_mbox_field(b, MZZ_MB_KICK) = seq;
+ 
++	/* Every slot is a cache line not read since the last flush, so each
++	 * read is fresh from DDR3; flush only when the ring wraps. */
+ 	for (;;) {
+-		if (mister_mbox_read(b, MZZ_MB_DONE) == seq)
++		if (*(volatile ULONG *)(ring + slot * MZZ_DONE_RING_STRIDE) == seq)
+ 			break;
++		if (++slot == MZZ_DONE_RING_SLOTS) {
++			slot = 0;
++			mister_fpga_cache_clear();
++		}
+ 		polls++;
+ 		if (polls > MISTER_TAKEN_POLLS ||
+-		    (polls > MISTER_UNTAKEN_POLLS &&
++		    (polls > MISTER_UNTAKEN_POLLS && slot == 0 &&
+ 		     *mister_mbox_field(b, MZZ_MB_TAKEN) != seq)) {
+ 			/* The MiSTer side is gone (binary replaced/killed): stop
+ 			 * offloading. Every hook falls back to the P96 software
+@@ -312,7 +322,7 @@ static void mister_kick(struct BoardInfo *b, UWORD op) {
+ 	}
+ 	/* An interrupt between the last clear and DONE could have cached
+ 	 * pre-blit pixels; make sure the CPU sees the ARM's result. */
+-	CacheClearU();
++	mister_fpga_cache_clear();
+ }
+ 
+ /* Handshake with the MiSTer binary (protocol in mister_zz9000.h).
+@@ -425,8 +435,17 @@ static inline uint16_t mnt_colormode(UWORD format) {
+ 	return MNTVA_COLOR_NO_USE;
+ }
+ 
++static inline void mister_diag_hook(struct BoardInfo *b, ULONG format, BOOL fallback) {
++	(*mister_mbox_field(b, MZZ_MB_DRV_HOOKS))++;
++	if (fallback)
++		(*mister_mbox_field(b, MZZ_MB_DRV_FALLBACKS))++;
++	*mister_mbox_field(b, MZZ_MB_DRV_LAST_FMT) = format;
++}
++
+ static inline uint16_t blit_colormode(struct BoardInfo *b, UWORD format) {
+-	return mister_accel(b) ? mnt_colormode(format) : MNTVA_COLOR_NO_USE;
++	uint16_t cm = mister_accel(b) ? mnt_colormode(format) : MNTVA_COLOR_NO_USE;
++	mister_diag_hook(b, format, cm == MNTVA_COLOR_NO_USE);
++	return cm;
+ }
+ 
+ static inline uint16_t panning_colormode(uint16_t colormode) {
+@@ -998,6 +1017,8 @@ int __attribute__((used)) FindCard(__REGA0(struct BoardInfo* b)) {
+ 	b->CardData[ZZ_CARD_DATA_GFXDATA] = (ULONG)((uint8_t *)b->MemoryBase + Z3_GFXDATA_ADDR);
+ 
+ 	b->CardData[ZZ_CARD_DATA_MISTER_ACCEL] = mister_attach(b);
++	*mister_mbox_field(b, MZZ_MB_DRV_STATE) =
++		b->CardData[ZZ_CARD_DATA_MISTER_ACCEL] ? MZZ_DRV_ATTACHED : 0;
+ 
+ 	KPrintF(device_id_string);
+ 	KPrintF("MiSTerZZ.card: RTG board at %lx, ARM blitter %s\n",
+@@ -1020,9 +1041,10 @@ int __attribute__((used)) InitCard(__REGA0(struct BoardInfo* b), __REGA1(char **
+ 
+ 	b->CardBase = (struct CardBase *)_gfxbase;
+ 	b->ExecBase = SysBase;
+-	b->BoardName = "MiSTerZZ";
+-	/* Same identity MiSTer.card reports, so existing P96 prefs/monitor
+-	 * setups for the Minimig RTG board keep working. */
++	/* Same identity MiSTer.card reports (board name "MiSTer", type 10):
++	 * Picasso96Settings keys the screen modes on these, so an existing
++	 * MiSTer.card setup keeps its modes. */
++	b->BoardName = "MiSTer";
+ 	b->BoardType = 10;
+ 	b->PaletteChipType = 0;
+ 	b->GraphicsControllerType = 0;
+@@ -1091,6 +1113,9 @@ int __attribute__((used)) InitCard(__REGA0(struct BoardInfo* b), __REGA1(char **
+ 	blitter_cache_reset(&blitter_register_cache);
+ 	gfxdata_byte_cache_reset();
+ 
++	*mister_mbox_field(b, MZZ_MB_DRV_STATE) |= MZZ_DRV_INITCARD |
++		((b->Flags & BIF_BLITTER) ? MZZ_DRV_BLITTER : 0);
++
+ 	return 1;
+ }
+ 
+@@ -2720,8 +2745,10 @@ void BlitPlanar2Chunky(__REGA0(struct BoardInfo *b), __REGA1(struct BitMap *bm),
+ 		return;
+ 	}
+ 	/* MiSTer: ARM blitter attached, at most 8 planes, staging area fits. */
+-	if (!mister_accel(b) || bm->Depth > 8 ||
+-	    (uint32_t)output_plane_size * bm->Depth > MZZ_TEMPLATE_SIZE) {
++	BOOL p2c_fallback = !mister_accel(b) || bm->Depth > 8 ||
++	    (uint32_t)output_plane_size * bm->Depth > MZZ_TEMPLATE_SIZE;
++	mister_diag_hook(b, r->RGBFormat, p2c_fallback);
++	if (p2c_fallback) {
+ 		b->BlitPlanar2ChunkyDefault(b, bm, r, x, y, dx, dy, w, h, minterm, mask);
+ 		return;
+ 	}
+@@ -2817,7 +2844,7 @@ void BlitPlanar2Direct(__REGA0(struct BoardInfo *b), __REGA1(struct BitMap *bm),
+ 	/* MiSTer: ARM blitter attached, a 16/32-bit target (no ZZ9000 24-bit
+ 	 * mode), at most 8 planes, colour table + planes fit the staging area. */
+ 	{
+-		uint16_t cm = blit_colormode(b, r->RGBFormat);
++		uint16_t cm = blit_colormode(b, r->RGBFormat);   /* counts the hook */
+ 		if (cm == MNTVA_COLOR_NO_USE || cm == MNTVA_COLOR_8BIT || bm->Depth > 8 ||
+ 		    (256 << 2) + (uint32_t)output_plane_size * bm->Depth > MZZ_TEMPLATE_SIZE) {
+ 			b->BlitPlanar2DirectDefault(b, bm, r, clut, x, y, dx, dy, w, h, minterm, mask);
+diff --git a/zz9000/amiga/tools/MiSTerZZInfo.c b/zz9000/amiga/tools/MiSTerZZInfo.c
+index 693c347e..b833b0a0 100644
+--- a/zz9000/amiga/tools/MiSTerZZInfo.c
++++ b/zz9000/amiga/tools/MiSTerZZInfo.c
+@@ -17,12 +17,13 @@
+ /* NDK 3.2 ULONG is unsigned int (32-bit): printf with %u/%X. */
+ 
+ #include "../../common/mister_zz9000.h"
++#include "../../common/mister_zz9000_cache.h"
+ 
+ struct ExpansionBase *ExpansionBase;
+ 
+ static ULONG mb(UBYTE *board, ULONG field)
+ {
+-	CacheClearU();   /* the FPGA CPU cache holds RTG window lines */
++	mister_fpga_cache_clear();   /* the FPGA CPU cache holds RTG window lines */
+ 	return *(volatile ULONG *)(board + MZZ_MBOX_OFFSET + field);
+ }
+ 
+@@ -72,6 +73,14 @@ int main(void)
+ 		mb(board, MZZ_MB_VERSION), mb(board, MZZ_MB_CAPS),
+ 		mb(board, MZZ_MB_OPS), mb(board, MZZ_MB_REJECTED));
+ 
++	ULONG st = mb(board, MZZ_MB_DRV_STATE);
++	printf("driver state     $%X (%s%s%s), %u hook calls, %u to P96 default, last format %u\n",
++		st, (st & MZZ_DRV_ATTACHED) ? "attached " : "",
++		(st & MZZ_DRV_INITCARD) ? "initcard " : "",
++		(st & MZZ_DRV_BLITTER) ? "BIF_BLITTER" : "",
++		mb(board, MZZ_MB_DRV_HOOKS), mb(board, MZZ_MB_DRV_FALLBACKS),
++		mb(board, MZZ_MB_DRV_LAST_FMT));
++
+ 	ULONG hb0 = mb(board, MZZ_MB_HEARTBEAT);
+ 	Delay(25);
+ 	ULONG hb1 = mb(board, MZZ_MB_HEARTBEAT);
+diff --git a/zz9000/amiga/tools/MiSTerZZTest.c b/zz9000/amiga/tools/MiSTerZZTest.c
+new file mode 100644
+index 00000000..85970b9d
+--- /dev/null
++++ b/zz9000/amiga/tools/MiSTerZZTest.c
+@@ -0,0 +1,342 @@
++/*
++ * MiSTerZZTest - hardware test for MiSTerZZ.card.
++ *
++ * Draws one scene with graphics.library twice: on a Picasso96 screen of the
++ * MiSTer RTG board (so every primitive goes through the accelerated hooks
++ * and the ARM blitter), and on a planar chip-RAM bitmap rendered by the
++ * native Amiga blitter as the reference. Then compares the two pixel for
++ * pixel, and reports how many ops the ARM executed (mailbox OPS counter).
++ * Optionally benchmarks the primitives.
++ *
++ *   MiSTerZZTest [DEPTH 8|16|32] [HOLD secs] [BENCH] [LOG file]
++ *
++ * 16/32-bit screens are compared through the pen palette (quantised for
++ * 16-bit); the scene steps whose meaning differs between pens and direct
++ * colour (COMPLEMENT, XOR minterm) only run on 8-bit screens.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#include <proto/exec.h>
++#include <proto/dos.h>
++#include <proto/graphics.h>
++#include <proto/intuition.h>
++#include <proto/expansion.h>
++#include <proto/timer.h>
++#include <proto/Picasso96.h>
++#include <graphics/rastport.h>
++#include <graphics/gfxmacros.h>
++#include <intuition/screens.h>
++#include <libraries/configvars.h>
++#include <devices/timer.h>
++#include <stdio.h>
++#include <string.h>
++#include <stdarg.h>
++
++#include "../../common/mister_zz9000.h"
++#include "../../common/mister_zz9000_cache.h"
++
++/* NDK 3.2: ULONG is unsigned int - printf with %u/%X. */
++
++struct Library *P96Base;
++struct ExpansionBase *ExpansionBase;
++struct Device *TimerBase;
++
++#define AW 320
++#define AH 200
++
++static BPTR logfh;
++static UBYTE *board;
++static ULONG pal[256];
++
++static void out(const char *fmt, ...)
++{
++	char buf[256];
++	va_list ap;
++	va_start(ap, fmt);
++	vsnprintf(buf, sizeof buf, fmt, ap);
++	va_end(ap);
++	fputs(buf, stdout);
++	fflush(stdout);
++	if (logfh)
++		FPuts(logfh, (STRPTR)buf);
++}
++
++static ULONG mb(ULONG field)
++{
++	if (!board) return 0;
++	mister_fpga_cache_clear();
++	return *(volatile ULONG *)(board + MZZ_MBOX_OFFSET + field);
++}
++
++static UWORD area_pat[4] = { 0xF0F0, 0x0F0F, 0xAAAA, 0x5555 };
++
++/* The scene. full = also the steps that only make sense with pens. */
++static void scene(struct RastPort *rp, struct BitMap *planar, int full)
++{
++	int i;
++
++	SetDrMd(rp, JAM1);
++	SetAPen(rp, 0);
++	RectFill(rp, 0, 0, AW - 1, AH - 1);
++
++	/* FillRect: assorted sizes and odd edges */
++	for (i = 0; i < 24; i++) {
++		SetAPen(rp, (i * 17 + 3) & 255);
++		RectFill(rp, (i * 13) % 250, (i * 7) % 150, (i * 13) % 250 + 3 + i * 3, (i * 7) % 150 + 1 + i);
++	}
++
++	/* InvertRect (COMPLEMENT fill) */
++	if (full) {
++		SetDrMd(rp, COMPLEMENT);
++		RectFill(rp, 20, 30, 140, 90);
++		RectFill(rp, 101, 5, 102, 190);
++		SetDrMd(rp, JAM1);
++	}
++
++	/* BlitTemplate: text in JAM1, JAM2, INVERSVID (+COMPLEMENT) */
++	SetAPen(rp, 201); SetBPen(rp, 77);
++	Move(rp, 5, 120); Text(rp, "MiSTer ZZ9000 JAM1 text 0123", 28);
++	SetDrMd(rp, JAM2);
++	Move(rp, 7, 132); Text(rp, "JAM2 text with background!", 26);
++	SetDrMd(rp, JAM2 | INVERSVID);
++	Move(rp, 3, 144); Text(rp, "inverse video", 13);
++	if (full) {
++		SetDrMd(rp, COMPLEMENT);
++		Move(rp, 60, 156); Text(rp, "complement", 10);
++	}
++	SetDrMd(rp, JAM1);
++
++	/* DrawLine: solid fans, then patterned JAM2 */
++	for (i = 0; i < 16; i++) {
++		SetAPen(rp, 128 + i);
++		Move(rp, 250, 100);
++		Draw(rp, 180 + i * 9, (i & 1) ? 10 : 190);
++		Move(rp, 250, 100);
++		Draw(rp, (i & 2) ? 319 : 190, 20 + i * 10);
++	}
++	SetDrPt(rp, 0xF0F0);
++	SetDrMd(rp, JAM2);
++	SetAPen(rp, 33); SetBPen(rp, 66);
++	Move(rp, 200, 195); Draw(rp, 315, 160);
++	Move(rp, 200, 160); Draw(rp, 315, 160);
++	SetDrPt(rp, 0xFFFF);
++	SetDrMd(rp, JAM1);
++
++	/* BlitPattern: area pattern, JAM2 and JAM1 */
++	SetAfPt(rp, area_pat, 2);
++	SetAPen(rp, 99); SetBPen(rp, 150);
++	SetDrMd(rp, JAM2);
++	RectFill(rp, 150, 110, 230, 150);
++	SetDrMd(rp, JAM1);
++	SetAPen(rp, 250);
++	RectFill(rp, 165, 100, 205, 175);
++	SetAfPt(rp, NULL, 0);
++
++	/* BlitRect: overlapping scrolls in all four directions */
++	ScrollRaster(rp, 3, 2, 0, 0, 160, 100);
++	ScrollRaster(rp, -5, -1, 10, 10, 150, 90);
++	ScrollRaster(rp, 0, 7, 160, 0, 319, 99);
++	ScrollRaster(rp, -1, 0, 0, 100, 140, 199);
++
++	/* BlitRectNoMaskComplete: copy and XOR within the screen */
++	ClipBlit(rp, 0, 0, rp, 260, 140, 40, 30, 0xC0);
++	if (full)
++		ClipBlit(rp, 20, 20, rp, 270, 20, 40, 30, 0x60);
++
++	/* BlitPlanar2Chunky / 2Direct: planar chip bitmap onto the screen.
++	 * Targets are cleared first: with a shallower source, a planar
++	 * destination keeps its upper planes, a chunky/direct one cannot. */
++	SetAPen(rp, 0);
++	RectFill(rp, 290, 60, 318, 129);
++	RectFill(rp, 5, 170, 124, 194);
++	BltBitMapRastPort(planar, 3, 0, rp, 290, 60, 29, 70, 0xC0);
++	BltBitMapRastPort(planar, 0, 5, rp, 5, 170, 120, 25, 0xC0);
++
++	WaitBlit();
++}
++
++static void make_planar(struct BitMap *bm)
++{
++	for (int p = 0; p < bm->Depth; p++)
++		for (int y = 0; y < bm->Rows; y++)
++			for (int x = 0; x < bm->BytesPerRow; x++)
++				bm->Planes[p][y * bm->BytesPerRow + x] =
++					(UBYTE)((x * 37 + y * 11) ^ (p * 0x5B) ^ (y << p));
++}
++
++static ULONG expect_rgb(int depth, ULONG rgb)
++{
++	if (depth == 16)
++		return rgb & 0xF8FCF8;
++	return rgb & 0xFFFFFF;
++}
++
++static int compare(struct Screen *scr, struct RastPort *ref, int depth)
++{
++	static UBYTE refline[AW + 16], scrline[AW + 16];
++	struct RastPort tmp;
++	int bad = 0;
++
++	InitRastPort(&tmp);
++	tmp.BitMap = AllocBitMap(AW + 16, 1, 8, BMF_CLEAR, NULL);
++	for (int y = 0; y < AH; y++) {
++		ReadPixelLine8(ref, 0, y, AW, refline, &tmp);
++		if (depth == 8)
++			ReadPixelLine8(&scr->RastPort, 0, y, AW, scrline, &tmp);
++		for (int x = 0; x < AW; x++) {
++			int ok;
++			ULONG got, want;
++			if (depth == 8) {
++				got = scrline[x];
++				want = refline[x];
++				ok = got == want;
++			} else {
++				got = expect_rgb(depth, p96ReadPixel(&scr->RastPort, x, y));
++				want = expect_rgb(depth, pal[refline[x]]);
++				ok = got == want;
++			}
++			if (!ok) {
++				if (bad < 12)
++					out("  mismatch at %3d,%3d: got %06X want %06X (ref pen %u)\n",
++						x, y, got, want, refline[x]);
++				bad++;
++			}
++		}
++	}
++	FreeBitMap(tmp.BitMap);
++	return bad;
++}
++
++static double secs(struct EClockVal *a, struct EClockVal *b, ULONG freq)
++{
++	double ta = a->ev_hi * 4294967296.0 + a->ev_lo;
++	double tb = b->ev_hi * 4294967296.0 + b->ev_lo;
++	return (tb - ta) / freq;
++}
++
++static void bench(struct RastPort *rp)
++{
++	struct EClockVal t0, t1;
++	ULONG freq, ops0;
++	int i;
++	char line[41];
++
++	memset(line, 'W', 40);
++	line[40] = 0;
++
++#define BENCH(label, n, body) do { \
++	ops0 = mb(MZZ_MB_OPS); freq = ReadEClock(&t0); \
++	for (i = 0; i < (n); i++) { body; } \
++	WaitBlit(); ReadEClock(&t1); \
++	double s = secs(&t0, &t1, freq); \
++	out("  %-28s %6d in %6.3fs = %8.1f/s  (ARM ops %u)\n", label, (n), s, (n) / s, mb(MZZ_MB_OPS) - ops0); \
++	} while (0)
++
++	SetDrMd(rp, JAM1);
++	BENCH("RectFill 64x64", 2000, { SetAPen(rp, i & 255); RectFill(rp, (i * 7) % 250, (i * 3) % 130, (i * 7) % 250 + 63, (i * 3) % 130 + 63); });
++	BENCH("RectFill 320x200", 300, { SetAPen(rp, i & 255); RectFill(rp, 0, 0, AW - 1, AH - 1); });
++	BENCH("ScrollRaster 320x200 by 1", 300, ScrollRaster(rp, 0, 1, 0, 0, AW - 1, AH - 1));
++	SetAPen(rp, 1); SetBPen(rp, 2); SetDrMd(rp, JAM2);
++	BENCH("Text 40 chars JAM2", 1000, { Move(rp, 0, 8 + (i % 24) * 8); Text(rp, line, 40); });
++	SetDrMd(rp, JAM1);
++	BENCH("Draw line ~200px", 3000, { SetAPen(rp, i & 255); Move(rp, i % 320, 0); Draw(rp, 319 - i % 320, 199); });
++#undef BENCH
++}
++
++int main(void)
++{
++	LONG args[4] = { 0 };
++	struct RDArgs *rda = ReadArgs((STRPTR)"DEPTH/N,HOLD/N,BENCH/S,LOG/K", args, NULL);
++	int depth = args[0] ? *(LONG *)args[0] : 8;
++	int hold = args[1] ? *(LONG *)args[1] : 0;
++	int rc = 10;
++	struct timerequest tr;
++	struct Screen *scr = NULL;
++	struct BitMap *refbm = NULL, *planar = NULL;
++	struct ConfigDev *cd;
++
++	if (args[3])
++		logfh = Open((STRPTR)args[3], MODE_NEWFILE);
++
++	if (!(P96Base = OpenLibrary((STRPTR)"Picasso96API.library", 2))) {
++		out("needs Picasso96API.library\n");
++		goto done;
++	}
++	if ((ExpansionBase = (struct ExpansionBase *)OpenLibrary((STRPTR)"expansion.library", 0))) {
++		if ((cd = FindConfigDev(NULL, MZZ_RTG_MANUFACTURER, MZZ_RTG_PRODUCT)))
++			board = (UBYTE *)cd->cd_BoardAddr;
++		CloseLibrary((struct Library *)ExpansionBase);
++	}
++	if (OpenDevice((STRPTR)TIMERNAME, UNIT_ECLOCK, (struct IORequest *)&tr, 0)) {
++		out("no timer.device\n");
++		goto done;
++	}
++	TimerBase = tr.tr_node.io_Device;
++
++	ULONG fmts = depth == 8 ? RGBFF_CLUT : depth == 16 ? RGBFF_R5G6B5PC : RGBFF_R8G8B8A8;
++	ULONG id = p96BestModeIDTags(P96BIDTAG_NominalWidth, 640, P96BIDTAG_NominalHeight, 480,
++		P96BIDTAG_FormatsAllowed, fmts, TAG_DONE);
++	if (id == INVALID_ID) {
++		out("no %d-bit P96 mode available\n", depth);
++		goto done_timer;
++	}
++	out("MiSTerZZTest: mode $%08X %ux%u, %s, depth %d, ARM %s\n", id,
++		p96GetModeIDAttr(id, P96IDA_WIDTH), p96GetModeIDAttr(id, P96IDA_HEIGHT),
++		(char *)p96GetModeIDAttr(id, P96IDA_BOARDNAME), depth,
++		mb(MZZ_MB_ACK_MAGIC) == MZZ_ACK_MAGIC ? "attached" : "NOT attached");
++
++	scr = p96OpenScreenTags(P96SA_DisplayID, id, P96SA_RGBFormat,
++		depth == 8 ? RGBFB_CLUT : depth == 16 ? RGBFB_R5G6B5PC : RGBFB_R8G8B8A8,
++		P96SA_Depth, depth == 32 ? 24 : depth, P96SA_Quiet, TRUE, P96SA_ShowTitle, FALSE, TAG_DONE);
++	if (!scr) {
++		out("cannot open screen\n");
++		goto done_timer;
++	}
++
++	for (int i = 0; i < 256; i++) {
++		ULONG r = i, g = (i * 7) & 255, b = (i * 13 + 64) & 255;
++		pal[i] = (r << 16) | (g << 8) | b;
++		SetRGB32(&scr->ViewPort, i, r * 0x01010101u, g * 0x01010101u, b * 0x01010101u);
++	}
++
++	refbm = AllocBitMap(AW, AH, 8, BMF_CLEAR, NULL);
++	planar = AllocBitMap(160, 80, depth == 8 ? 8 : 5, BMF_CLEAR, NULL);
++	if (!refbm || !planar) {
++		out("out of chip memory\n");
++		goto done_screen;
++	}
++	make_planar(planar);
++
++	struct RastPort ref;
++	InitRastPort(&ref);
++	ref.BitMap = refbm;
++	SetFont(&ref, scr->RastPort.Font);
++
++	ULONG ops0 = mb(MZZ_MB_OPS), rej0 = mb(MZZ_MB_REJECTED);
++	scene(&scr->RastPort, planar, depth == 8);
++	ULONG ops = mb(MZZ_MB_OPS) - ops0, rej = mb(MZZ_MB_REJECTED) - rej0;
++	scene(&ref, planar, depth == 8);
++
++	int bad = compare(scr, &ref, depth);
++	out("scene: %u ARM ops, %u rejected, %d of %d pixels differ -> %s\n",
++		ops, rej, bad, AW * AH, (bad == 0 && ops > 0) ? "PASS" : "FAIL");
++	rc = (bad == 0 && ops > 0) ? 0 : 5;
++
++	if (hold)
++		Delay(hold * 50);
++
++	if (args[2])
++		bench(&scr->RastPort);
++
++done_screen:
++	if (planar) FreeBitMap(planar);
++	if (refbm) FreeBitMap(refbm);
++	CloseScreen(scr);
++done_timer:
++	CloseDevice((struct IORequest *)&tr);
++done:
++	if (P96Base) CloseLibrary(P96Base);
++	if (logfh) Close(logfh);
++	if (rda) FreeArgs(rda);
++	return rc;
++}
+diff --git a/zz9000/amiga/tools/SetToolType.c b/zz9000/amiga/tools/SetToolType.c
+new file mode 100644
+index 00000000..33ddde4f
+--- /dev/null
++++ b/zz9000/amiga/tools/SetToolType.c
+@@ -0,0 +1,71 @@
++/*
++ * SetToolType <icon> <NAME=VALUE> - set (or add) one tooltype of an icon.
++ *
++ * <icon> is given without ".info". An existing NAME or NAME=... entry is
++ * replaced; otherwise the entry is appended. Used to point a Picasso96
++ * monitor file at MiSTerZZ.card (BOARDTYPE=MiSTerZZ) from the CLI.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#include <proto/exec.h>
++#include <proto/icon.h>
++#include <workbench/workbench.h>
++#include <stdio.h>
++#include <string.h>
++
++struct Library *IconBase;
++
++static int same_key(const char *a, const char *b)
++{
++	while (*a && *a != '=' && *b && *b != '=') {
++		char x = *a++, y = *b++;
++		if (x >= 'a' && x <= 'z') x -= 32;
++		if (y >= 'a' && y <= 'z') y -= 32;
++		if (x != y) return 0;
++	}
++	return (*a == 0 || *a == '=') && (*b == 0 || *b == '=');
++}
++
++int main(int argc, char **argv)
++{
++	static STRPTR tt[64];
++	struct DiskObject *dob;
++	int n = 0, found = 0, rc = 0;
++
++	if (argc != 3) {
++		printf("usage: SetToolType <icon> <NAME=VALUE>\n");
++		return 10;
++	}
++	if (!(IconBase = OpenLibrary((STRPTR)"icon.library", 36)))
++		return 20;
++	if (!(dob = GetDiskObject((STRPTR)argv[1]))) {
++		printf("SetToolType: cannot read %s.info\n", argv[1]);
++		CloseLibrary(IconBase);
++		return 10;
++	}
++
++	for (STRPTR *p = (STRPTR *)dob->do_ToolTypes; p && *p && n < 62; p++) {
++		if (same_key((char *)*p, argv[2])) {
++			tt[n++] = (STRPTR)argv[2];
++			found = 1;
++		} else {
++			tt[n++] = *p;
++		}
++	}
++	if (!found)
++		tt[n++] = (STRPTR)argv[2];
++	tt[n] = NULL;
++
++	STRPTR *old = (STRPTR *)dob->do_ToolTypes;
++	dob->do_ToolTypes = tt;
++	if (!PutDiskObject((STRPTR)argv[1], dob)) {
++		printf("SetToolType: cannot write %s.info\n", argv[1]);
++		rc = 10;
++	} else {
++		printf("%s: %s %s\n", argv[1], found ? "replaced" : "added", argv[2]);
++	}
++	dob->do_ToolTypes = old;
++	FreeDiskObject(dob);
++	CloseLibrary(IconBase);
++	return rc;
++}
+diff --git a/zz9000/common/mister_zz9000.h b/zz9000/common/mister_zz9000.h
+index 5541b0dc..f73a3987 100644
+--- a/zz9000/common/mister_zz9000.h
++++ b/zz9000/common/mister_zz9000.h
+@@ -29,11 +29,12 @@
+  * Commands are synchronous, like the ZZ9000's register-triggered DMA ops:
+  * the driver fills GFXData (and the staging area), writes OP, then
+  * increments KICK. The ARM writes TAKEN=KICK when it starts, runs the op
+- * with the official ZZ9000OS blitter, then writes DONE=KICK. The driver
+- * spins until DONE==KICK, calling CacheClearU() before every read because
+- * the FPGA CPU cache (cpu_cache_new) does cache the RTG window and would
+- * otherwise hand back stale mailbox words - and stale pixels after an ARM
+- * blit.
++ * with the official ZZ9000OS blitter, then writes DONE=KICK (and into the
++ * DONE ring). The driver spins until it reads DONE==KICK. The FPGA CPU
++ * cache (cpu_cache_new) caches the RTG window, so the driver reads the
++ * ring (fresh lines) and flushes that cache after the op, or it would see
++ * stale mailbox words and stale pixels. See mister_zz9000_cache.h for why
++ * CacheClearU() cannot do the flush.
+  *
+  * SPDX-License-Identifier: GPL-3.0-or-later
+  */
+@@ -70,11 +71,28 @@
+ #define MZZ_MB_HEARTBEAT       0x38   /* ARM: increments while the thread runs */
+ #define MZZ_MB_OPS             0x3C   /* ARM: ops executed (statistics) */
+ #define MZZ_MB_REJECTED        0x40   /* ARM: ops refused (unknown / out of range) */
++/* Driver diagnostics (Amiga writes, nobody depends on them) */
++#define MZZ_MB_DRV_STATE       0x80   /* MZZ_DRV_* bits */
++#define MZZ_MB_DRV_HOOKS       0x84   /* accelerated P96 hook entries */
++#define MZZ_MB_DRV_FALLBACKS   0x88   /* of those, handed to the P96 default */
++#define MZZ_MB_DRV_LAST_FMT    0x8C   /* RGBFTYPE of the last hook call */
++#define MZZ_DRV_ATTACHED       (1UL << 0)   /* FindCard: ARM answered */
++#define MZZ_DRV_INITCARD       (1UL << 1)   /* InitCard ran */
++#define MZZ_DRV_BLITTER        (1UL << 2)   /* InitCard set BIF_BLITTER */
+ #define MZZ_MB_SIZE            0x100
+ 
++/* DONE ring (protocol 2): after every op the ARM also writes DONE into
++ * MZZ_DONE_RING_SLOTS words, each on its own FPGA cache line. The driver
++ * polls a different slot per read, so each read misses the CPU cache and
++ * sees DDR3 without a cache flush; it only flushes when the ring wraps and
++ * once after the op. (cpu_cache_new: 2-way, 256 sets of 8-byte lines.) */
++#define MZZ_DONE_RING_OFFSET   (MZZ_MBOX_OFFSET + 0x400)
++#define MZZ_DONE_RING_SLOTS    64
++#define MZZ_DONE_RING_STRIDE   32
++
+ #define MZZ_REQ_MAGIC          0x4D5A5A39UL   /* 'MZZ9' */
+ #define MZZ_ACK_MAGIC          0x6D7A7A39UL   /* 'mzz9' */
+-#define MZZ_PROTOCOL_VERSION   1
++#define MZZ_PROTOCOL_VERSION   2
+ 
+ /* Ops the ARM executes (enum gfx_dma_op values from the ZZ9000 sources) */
+ #define MZZ_CAP_FILLRECT       (1UL << 2)
+diff --git a/zz9000/common/mister_zz9000_cache.h b/zz9000/common/mister_zz9000_cache.h
+new file mode 100644
+index 00000000..ca98f280
+--- /dev/null
++++ b/zz9000/common/mister_zz9000_cache.h
+@@ -0,0 +1,45 @@
++/*
++ * Flush the Minimig FPGA CPU cache from the 68k (m68k only).
++ *
++ * The RTG window is cached by cpu_cache_new in ddram_ctrl, which clears
++ * itself on a 0->1 edge of CACR bit 3 (CI) as seen by the TG68 - and the
++ * TG68 keeps that bit latched. exec's CacheClearU() only ever writes CI=1,
++ * so after the first call there is no edge and nothing is cleared (until
++ * some CacheControl() happens to write CI=0). Toggle CI 0->1 here instead.
++ *
++ * The cache samples CACR only while the CPU is not using that RAM
++ * controller (cpu_cache_new: cc_clr_r updates when !cpu_cs); the code runs
++ * from fast RAM on the same controller, so a chip register read after each
++ * CACR write guarantees it sees both levels. On a real 68020/030 CI is a
++ * plain "clear instruction cache" command, so the extra write is harmless.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#ifndef MISTER_ZZ9000_CACHE_H
++#define MISTER_ZZ9000_CACHE_H
++
++#include <proto/exec.h>
++
++static inline void mister_fpga_cache_clear(void)
++{
++	APTR ssp = SuperState();   /* NULL if already in supervisor mode */
++
++	__asm__ volatile(
++		"	movec	%%cacr,%%d0\n"
++		"	moveq	#-9,%%d1\n"
++		"	and.l	%%d1,%%d0\n"
++		"	movec	%%d0,%%cacr\n"     /* CI = 0 */
++		"	tst.w	0xdff006\n"
++		"	tst.w	0xdff006\n"
++		"	moveq	#8,%%d1\n"
++		"	or.l	%%d1,%%d0\n"
++		"	movec	%%d0,%%cacr\n"     /* CI = 1: FPGA cache clears */
++		"	tst.w	0xdff006\n"
++		"	tst.w	0xdff006\n"
++		: : : "d0", "d1", "cc", "memory");
++
++	if (ssp)
++		UserState(ssp);
++}
++
++#endif
+diff --git a/zz9000/mister/minimig_zz9000.cpp b/zz9000/mister/minimig_zz9000.cpp
+index f05a42ad..280857ca 100644
+--- a/zz9000/mister/minimig_zz9000.cpp
++++ b/zz9000/mister/minimig_zz9000.cpp
+@@ -5,6 +5,11 @@
+ // so every microsecond of poll latency is a microsecond the 68k stalls),
+ // back off to 200us sleeps after a short idle period, and to 20ms while no
+ // driver has attached at all.
++//
++// The thread runs on the other core from the main loop. MiSTer pins itself
++// to CPU1 and busy-polls there; a thread that inherits that affinity only
++// gets CPU1 when the main thread's timeslice runs out, which measured as a
++// flat ~0.5ms per op on hardware.
+ 
+ #include <pthread.h>
+ #include <sched.h>
+@@ -23,6 +28,7 @@
+ #define ZZ_IDLE_SLEEP_US  200      // attached but idle
+ #define ZZ_NODRV_SLEEP_US 20000    // no driver: the Amiga handshake waits ~1s
+ #define ZZ_HEARTBEAT_US   100000
++#define ZZ_CPU            0        // MiSTer's main loop owns CPU1
+ 
+ static pthread_t zz_thread;
+ static volatile int zz_running = 0;
+@@ -130,5 +136,11 @@ void zz9000_start(void)
+ 		printf("ZZ9000: cannot start service thread\n");
+ 		return;
+ 	}
++
++	cpu_set_t cpus;
++	CPU_ZERO(&cpus);
++	CPU_SET(ZZ_CPU, &cpus);
++	if (pthread_setaffinity_np(zz_thread, sizeof(cpus), &cpus))
++		printf("ZZ9000: cannot move service thread to CPU%d\n", ZZ_CPU);
+ 	printf("ZZ9000: RTG blitter service started\n");
+ }
+diff --git a/zz9000/mister/zz9000_service.c b/zz9000/mister/zz9000_service.c
+index 83b70e22..62cf992d 100644
+--- a/zz9000/mister/zz9000_service.c
++++ b/zz9000/mister/zz9000_service.c
+@@ -65,6 +65,9 @@ int zz_service_poll(struct zz_service *s)
+ 		mb_wr(s, MZZ_MB_CAPS, MZZ_CAPS_V1);
+ 		mb_wr(s, MZZ_MB_TAKEN, s->done);
+ 		mb_wr(s, MZZ_MB_DONE, s->done);
++		for (unsigned i = 0; i < MZZ_DONE_RING_SLOTS; i++)
++			*(volatile uint32_t *)(s->fb + MZZ_DONE_RING_OFFSET + i * MZZ_DONE_RING_STRIDE) =
++				__builtin_bswap32(s->done);
+ 		mb_wr(s, MZZ_MB_OPS, 0);
+ 		mb_wr(s, MZZ_MB_REJECTED, 0);
+ 		__sync_synchronize();
+@@ -102,6 +105,9 @@ int zz_service_poll(struct zz_service *s)
+ 	/* Every pixel store must be visible in DDR3 before the 68k sees DONE. */
+ 	__sync_synchronize();
+ 	mb_wr(s, MZZ_MB_DONE, kick);
++	for (unsigned i = 0; i < MZZ_DONE_RING_SLOTS; i++)
++		*(volatile uint32_t *)(s->fb + MZZ_DONE_RING_OFFSET + i * MZZ_DONE_RING_STRIDE) =
++			__builtin_bswap32(kick);
+ 	s->done = kick;
+ 	return ZZ_POLL_OP;
+ }
+diff --git a/zz9000/tests/host/zz9000_host_test.c b/zz9000/tests/host/zz9000_host_test.c
+index 04dfb900..5a81a454 100644
+--- a/zz9000/tests/host/zz9000_host_test.c
++++ b/zz9000/tests/host/zz9000_host_test.c
+@@ -73,6 +73,11 @@ static void run(uint32_t op)
+ 	int r = zz_service_poll(&svc);
+ 	CHECK(r == ZZ_POLL_OP, "op %u: poll returned %d", op, r);
+ 	CHECK(mbr(MZZ_MB_DONE) == kick, "op %u: DONE %u != KICK %u", op, mbr(MZZ_MB_DONE), kick);
++	for (unsigned i = 0; i < MZZ_DONE_RING_SLOTS; i++)
++		if (rd_be32(MZZ_DONE_RING_OFFSET + i * MZZ_DONE_RING_STRIDE) != kick) {
++			CHECK(0, "op %u: DONE ring slot %u stale", op, i);
++			break;
++		}
+ 	CHECK(zz_service_poll(&svc) == ZZ_POLL_IDLE, "op %u: not idle afterwards", op);
+ }
+ 
+@@ -181,6 +186,7 @@ static void test_handshake(void)
+ 	CHECK(mbr(MZZ_MB_ACK_MAGIC) == MZZ_ACK_MAGIC, "ack magic");
+ 	CHECK(mbr(MZZ_MB_ACK_SESSION) == 0x1234 + 77, "ack session");
+ 	CHECK(mbr(MZZ_MB_DONE) == 77, "done follows kick at attach");
++	CHECK(rd_be32(MZZ_DONE_RING_OFFSET + 63 * MZZ_DONE_RING_STRIDE) == 77, "ring primed at attach");
+ 	CHECK(mbr(MZZ_MB_VERSION) == MZZ_PROTOCOL_VERSION, "version");
+ 	CHECK(mbr(MZZ_MB_CAPS) == MZZ_CAPS_V1, "caps");
+ 	CHECK(zz_service_poll(&svc) == ZZ_POLL_IDLE, "idle after attach");
+-- 
+2.54.0 (Apple Git-157)
+

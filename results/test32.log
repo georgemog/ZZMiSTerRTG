@@ -1,0 +1,2 @@
+MiSTerZZTest: mode $50001302 640x480, MiSTer, depth 32, ARM attached
+scene: 79 ARM ops, 0 rejected, 0 of 64000 pixels differ -> PASS

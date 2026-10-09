@@ -1,0 +1,38 @@
+--- a/Makefile	2026-10-07 17:32:33.000000000 +0100
++++ b/Makefile	2026-10-09 11:32:23.161704514 +0100
+@@ -30,6 +30,7 @@
+ 
+ PRJ = MiSTer
+ C_SRC =   $(wildcard *.c) \
++          $(wildcard ./support/minimig/zz9000/*.c) \
+           $(wildcard ./lib/miniz/*.c) \
+           $(wildcard ./lib/md5/*.c) \
+           $(wildcard ./lib/lzma/*.c) \
+--- a/user_io.cpp	2026-10-07 17:32:33.000000000 +0100
++++ b/user_io.cpp	2026-10-09 11:32:23.162971263 +0100
+@@ -44,6 +44,7 @@
+ #include "frame_timer.h"
+ #include "scaler.h"
+ #include "support.h"
++#include "support/minimig/minimig_zz9000.h"
+ 
+ static char core_path[1024] = {};
+ static char rbf_path[1024] = {};
+@@ -1470,6 +1471,9 @@
+ 	// path below restarts them if the card is enabled.
+ 	a2065_stop();
+ 
++	// ...and the ZZ9000 RTG blitter thread.
++	zz9000_stop();
++
+ 	// Same for the NeXT ethernet bridge.
+ 	next_enet_stop();
+ 	sun_enet_stop();
+@@ -1647,6 +1651,7 @@
+ 					printf("Identified Minimig V2 core");
+ 					BootInit();
+ 					a2065_start();
++					zz9000_start();
+ 				}
+ 				else if (is_x86() || is_pcxt())
+ 				{
